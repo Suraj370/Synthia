@@ -1,7 +1,10 @@
 mod app;
 mod components;
 mod editor_state;
+mod history;
 mod model;
+mod snapping;
+mod text_metrics;
 
 use app::App;
 

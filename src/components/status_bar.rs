@@ -11,12 +11,10 @@ pub fn status_bar() -> Html {
     html! {
         <footer class="status-bar">
             <span class="status-bar__item">{"800 × 600"}</span>
-            <span class="status-bar__divider"></span>
-            <span class="status-bar__item">{"x: 0, y: 0"}</span>
             <span class="status-bar__spacer"></span>
             <span class="status-bar__item">{object_count}</span>
-            <span class="status-bar__divider"></span>
-            <span class="status-bar__item">{"100%"}</span>
+            <span class="status-bar__spacer"></span>
+            <span class="status-bar__item status-bar__item--zoom">{"100%"}</span>
         </footer>
     }
 }

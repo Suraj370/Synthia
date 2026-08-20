@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use web_sys::{Element, KeyboardEvent};
 use yew::prelude::*;
 
@@ -7,6 +9,7 @@ use crate::components::right_panel::RightPanel;
 use crate::components::status_bar::StatusBar;
 use crate::components::top_toolbar::TopToolbar;
 use crate::editor_state::{EditorAction, EditorContext, EditorState};
+use crate::model::{Geometry, ObjectId};
 
 const NUDGE_STEP: f64 = 1.0;
 const NUDGE_STEP_LARGE: f64 = 10.0;
@@ -21,40 +24,80 @@ pub fn app() -> Html {
             // Let typing in a Properties field behave normally instead of
             // being hijacked as a canvas shortcut.
             if let Some(target) = event.target_dyn_into::<Element>() {
-                if target.tag_name() == "INPUT" {
+                let tag = target.tag_name();
+                if tag == "INPUT" || tag == "TEXTAREA" {
                     return;
                 }
             }
 
             match event.key().as_str() {
                 "Escape" => {
-                    editor.dispatch(EditorAction::SelectObject(None));
+                    editor.dispatch(EditorAction::SetSelection(BTreeSet::new()));
                 }
                 "Delete" => {
-                    if let Some(id) = editor.selected_id {
+                    if !editor.selected_ids.is_empty() {
                         event.prevent_default();
-                        editor.dispatch(EditorAction::DeleteObject(id));
+                        editor.dispatch(EditorAction::DeleteObjects(editor.selected_ids.iter().copied().collect()));
                     }
                 }
                 key @ ("ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown") => {
-                    let Some(id) = editor.selected_id else { return };
-                    let Some(object) = editor.document.get(id) else { return };
+                    if editor.selected_ids.is_empty() {
+                        return;
+                    }
                     event.prevent_default();
                     let step = if event.shift_key() { NUDGE_STEP_LARGE } else { NUDGE_STEP };
-                    let mut geometry = object.geometry;
-                    match key {
-                        "ArrowLeft" => geometry.x -= step,
-                        "ArrowRight" => geometry.x += step,
-                        "ArrowUp" => geometry.y -= step,
-                        "ArrowDown" => geometry.y += step,
+                    let (dx, dy) = match key {
+                        "ArrowLeft" => (-step, 0.0),
+                        "ArrowRight" => (step, 0.0),
+                        "ArrowUp" => (0.0, -step),
+                        "ArrowDown" => (0.0, step),
                         _ => unreachable!(),
+                    };
+                    let changes: Vec<(ObjectId, Geometry, Geometry)> = editor
+                        .selected_ids
+                        .iter()
+                        .filter_map(|id| {
+                            editor.document.get(*id).map(|object| {
+                                let before = object.geometry;
+                                let after = Geometry { x: before.x + dx, y: before.y + dy, ..before };
+                                (*id, before, after)
+                            })
+                        })
+                        .collect();
+                    if !changes.is_empty() {
+                        editor.dispatch(EditorAction::CommitGeometries(changes));
                     }
-                    editor.dispatch(EditorAction::UpdateGeometry { id, geometry });
+                }
+                key if (event.ctrl_key() || event.meta_key()) && key.eq_ignore_ascii_case("z") => {
+                    event.prevent_default();
+                    if event.shift_key() {
+                        editor.dispatch(EditorAction::Redo);
+                    } else {
+                        editor.dispatch(EditorAction::Undo);
+                    }
                 }
                 key if (event.ctrl_key() || event.meta_key()) && key.eq_ignore_ascii_case("d") => {
-                    if let Some(id) = editor.selected_id {
+                    if !editor.selected_ids.is_empty() {
                         event.prevent_default();
-                        editor.dispatch(EditorAction::DuplicateObject(id));
+                        editor.dispatch(EditorAction::DuplicateObjects(editor.selected_ids.iter().copied().collect()));
+                    }
+                }
+                key if (event.ctrl_key() || event.meta_key()) && key.eq_ignore_ascii_case("c") => {
+                    if !editor.selected_ids.is_empty() {
+                        event.prevent_default();
+                        editor.dispatch(EditorAction::Copy);
+                    }
+                }
+                key if (event.ctrl_key() || event.meta_key()) && key.eq_ignore_ascii_case("v") => {
+                    event.prevent_default();
+                    editor.dispatch(EditorAction::Paste);
+                }
+                key if (event.ctrl_key() || event.meta_key()) && key.eq_ignore_ascii_case("g") => {
+                    event.prevent_default();
+                    if event.shift_key() {
+                        editor.dispatch(EditorAction::UngroupSelected);
+                    } else {
+                        editor.dispatch(EditorAction::GroupSelected);
                     }
                 }
                 _ => {}
