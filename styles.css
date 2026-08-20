@@ -187,6 +187,10 @@ input {
   background-size: 24px 24px;
 }
 
+.canvas-area:focus {
+  outline: none;
+}
+
 .canvas-area__artboard {
   background-color: var(--bg-artboard);
   border: 1px solid var(--border);
@@ -203,6 +207,10 @@ input {
 
 .canvas-object {
   cursor: pointer;
+}
+
+.canvas-object--selected {
+  cursor: move;
 }
 
 .canvas-object__rect,
@@ -245,6 +253,13 @@ input {
   stroke-width: 1.5;
   vector-effect: non-scaling-stroke;
   pointer-events: none;
+}
+
+.selection-box__handle {
+  fill: var(--bg-artboard);
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
 }
 
 /* Right panel */
@@ -313,6 +328,10 @@ input {
 .right-panel__layer--active {
   background-color: var(--accent-dim);
   color: var(--accent);
+}
+
+.right-panel__layer:focus {
+  outline: none;
 }
 
 .right-panel__layer-icon {

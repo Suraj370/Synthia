@@ -30,6 +30,9 @@ pub enum EditorAction {
     SetActiveTool(Tool),
     CreateObject { kind: ObjectKind, geometry: Geometry },
     SelectObject(Option<ObjectId>),
+    UpdateGeometry { id: ObjectId, geometry: Geometry },
+    DeleteObject(ObjectId),
+    DuplicateObject(ObjectId),
 }
 
 impl Reducible for EditorState {
@@ -48,6 +51,22 @@ impl Reducible for EditorState {
             }
             EditorAction::SelectObject(id) => {
                 next.selected_id = id;
+            }
+            EditorAction::UpdateGeometry { id, geometry } => {
+                if let Some(object) = next.document.get_mut(id) {
+                    object.geometry = geometry;
+                }
+            }
+            EditorAction::DeleteObject(id) => {
+                next.document.remove(id);
+                if next.selected_id == Some(id) {
+                    next.selected_id = None;
+                }
+            }
+            EditorAction::DuplicateObject(id) => {
+                if let Some(new_id) = next.document.duplicate(id) {
+                    next.selected_id = Some(new_id);
+                }
             }
         }
         Rc::new(next)
