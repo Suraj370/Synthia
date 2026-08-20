@@ -9,7 +9,25 @@ use std::rc::Rc;
 use yew::prelude::*;
 
 use crate::history::{batch, Command, History};
-use crate::model::{DesignDocument, DesignObject, Geometry, ObjectId, ObjectKind, TextProperties, TextSizeMode, DUPLICATE_OFFSET};
+use crate::model::{
+    DesignDocument, DesignObject, Geometry, ImageFit, ImageProperties, ObjectId, ObjectKind, TextProperties, TextSizeMode, DUPLICATE_OFFSET,
+};
+
+/// An imported image is scaled down (never up) so its larger dimension is
+/// at most this many canvas units — "a reasonable size that fits within
+/// the canvas" for an 800x600 artboard, while an already-small image keeps
+/// its natural size.
+const IMPORT_MAX_DIMENSION: f64 = 360.0;
+
+/// The display (width, height) for a freshly imported image, preserving
+/// its natural aspect ratio.
+fn fit_import_size(natural_width: f64, natural_height: f64) -> (f64, f64) {
+    if natural_width <= 0.0 || natural_height <= 0.0 {
+        return (IMPORT_MAX_DIMENSION, IMPORT_MAX_DIMENSION);
+    }
+    let scale = (IMPORT_MAX_DIMENSION / natural_width.max(natural_height)).min(1.0);
+    (natural_width * scale, natural_height * scale)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Tool {
@@ -113,6 +131,31 @@ pub enum EditorAction {
     /// `Fixed` mode (dragging a handle is the only way to reach `Fixed`),
     /// as one undo step.
     CommitTextResize { id: ObjectId, before_geometry: Geometry, before_props: TextProperties, after_props: TextProperties },
+    /// Imports a freshly decoded file as a brand-new image object,
+    /// centered on `center` and sized to fit the canvas — one undo step,
+    /// via the same `CreateObject` command every other object uses.
+    ImportImage {
+        filename: String,
+        mime_type: String,
+        natural_width: f64,
+        natural_height: f64,
+        reference: String,
+        center: (f64, f64),
+    },
+    /// One immediate, undoable image-property change from a Properties
+    /// panel field (fit mode) — not a new asset.
+    CommitImageProperties { id: ObjectId, before: ImageProperties, after: ImageProperties },
+    /// "Replace image": registers the freshly decoded file as a new asset
+    /// and points `id`'s existing image object at it, leaving its
+    /// transform untouched. One undo step.
+    ReplaceImageAsset {
+        id: ObjectId,
+        filename: String,
+        mime_type: String,
+        natural_width: f64,
+        natural_height: f64,
+        reference: String,
+    },
     Undo,
     Redo,
 }
@@ -493,6 +536,39 @@ impl Reducible for EditorState {
                     if let Some(command) = batch(commands) {
                         next.history.record(command);
                     }
+                }
+            }
+
+            EditorAction::ImportImage { filename, mime_type, natural_width, natural_height, reference, center } => {
+                let asset_id = next.document.assets.insert(filename.clone(), mime_type, natural_width, natural_height, reference);
+                let (width, height) = fit_import_size(natural_width, natural_height);
+                let geometry = Geometry::new(center.0 - width / 2.0, center.1 - height / 2.0, width, height);
+                let id = next.document.insert(ObjectKind::Image(ImageProperties { asset_id, fit: ImageFit::default() }), geometry);
+                if let Some(object) = next.document.get_mut(id) {
+                    object.name = filename;
+                    next.history.record(Command::CreateObject { object: object.clone() });
+                }
+                next.selected_ids = BTreeSet::from([id]);
+                next.active_tool = Tool::Select;
+            }
+
+            EditorAction::CommitImageProperties { id, before, after } => {
+                if before != after {
+                    if let Some(object) = next.document.get_mut(id) {
+                        object.kind = ObjectKind::Image(after);
+                    }
+                    next.history.record(Command::SetImageProperties { id, before, after });
+                }
+            }
+
+            EditorAction::ReplaceImageAsset { id, filename, mime_type, natural_width, natural_height, reference } => {
+                if let Some(ObjectKind::Image(before)) = next.document.get(id).map(|o| o.kind.clone()) {
+                    let asset_id = next.document.assets.insert(filename, mime_type, natural_width, natural_height, reference);
+                    let after = ImageProperties { asset_id, ..before };
+                    if let Some(object) = next.document.get_mut(id) {
+                        object.kind = ObjectKind::Image(after);
+                    }
+                    next.history.record(Command::SetImageProperties { id, before, after });
                 }
             }
 

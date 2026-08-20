@@ -7,7 +7,12 @@ edition = "2021"
 [dependencies]
 yew = { version = "0.21", features = ["csr"] }
 console_error_panic_hook = "0.1.7"
-web-sys = { version = "0.3", features = ["Element", "DomRect", "MouseEvent", "KeyboardEvent", "HtmlInputElement", "DragEvent", "HtmlTextAreaElement", "InputEvent", "FocusEvent", "HtmlSelectElement"] }
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "Element", "DomRect", "MouseEvent", "KeyboardEvent", "HtmlInputElement", "DragEvent",
+    "HtmlTextAreaElement", "InputEvent", "FocusEvent", "HtmlSelectElement",
+    "File", "FileList", "DataTransfer", "Blob", "Url", "HtmlImageElement", "Event",
+] }
 
 [workspace]
 members = ["src-tauri"]

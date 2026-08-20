@@ -4,9 +4,10 @@ use web_sys::{DragEvent, HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
 
 use crate::editor_state::{use_editor, AlignMode, DistributeAxis, EditorAction, EditorContext};
+use crate::image_import::{files_from_input, import_image_file, ImportTarget};
 use crate::model::{
-    DesignDocument, FontFamily, FontStyle, FontWeight, Geometry, ObjectId, ObjectKind, TextAlign, TextDecoration, TextProperties,
-    MIN_OBJECT_SIZE,
+    DesignDocument, FontFamily, FontStyle, FontWeight, Geometry, ImageFit, ImageProperties, ObjectId, ObjectKind, TextAlign,
+    TextDecoration, TextProperties, MIN_OBJECT_SIZE,
 };
 
 fn format_number(value: f64) -> String {
@@ -32,7 +33,7 @@ fn kind_icon(kind: &ObjectKind) -> &'static str {
         ObjectKind::Rectangle => "▭",
         ObjectKind::Ellipse => "○",
         ObjectKind::Text(_) => "T",
-        ObjectKind::ImagePlaceholder => "▨",
+        ObjectKind::Image(_) => "▧",
         ObjectKind::Group => "▤",
     }
 }
@@ -367,8 +368,132 @@ fn render_text_inspector(editor: &EditorContext, selected_text: &Option<(ObjectI
     }
 }
 
+/// A row of toggle buttons bound to one image property — same shape as
+/// `text_segmented_field`, kept as its own small copy rather than a shared
+/// generic since the two properties structs have nothing else in common.
+fn image_segmented_field(
+    editor: &EditorContext,
+    selected: &Option<(ObjectId, ImageProperties)>,
+    label: &'static str,
+    options: &[(&'static str, &'static str)],
+    current: &str,
+    set: fn(&mut ImageProperties, &str),
+) -> Html {
+    let disabled = selected.is_none();
+    html! {
+        <div class="right-panel__field right-panel__field--wide">
+            <span class="right-panel__field-label">{label}</span>
+            <div class="right-panel__segmented">
+                { for options.iter().map(|(value, display)| {
+                    let editor = editor.clone();
+                    let selected = *selected;
+                    let value = *value;
+                    let active = value == current;
+                    let onclick = Callback::from(move |_| {
+                        if let Some((id, before)) = selected {
+                            let mut after = before;
+                            set(&mut after, value);
+                            editor.dispatch(EditorAction::CommitImageProperties { id, before, after });
+                        }
+                    });
+                    let class = if active {
+                        "right-panel__segmented-button right-panel__segmented-button--active"
+                    } else {
+                        "right-panel__segmented-button"
+                    };
+                    html! { <button key={value} type="button" {class} {disabled} {onclick}>{ *display }</button> }
+                }) }
+            </div>
+        </div>
+    }
+}
+
+/// Properties content for a single selected image object: Image
+/// (filename, original dimensions, Replace) + Fit + Opacity + Transform.
+fn render_image_inspector(
+    editor: &EditorContext,
+    document: &DesignDocument,
+    selected_image: &Option<(ObjectId, ImageProperties)>,
+    selected: Option<(ObjectId, Geometry)>,
+    replace_input_ref: NodeRef,
+) -> Html {
+    let asset = selected_image.and_then(|(_, props)| document.assets.get(props.asset_id));
+    let filename = asset.map(|a| a.filename.clone()).unwrap_or_else(|| "—".to_string());
+    let original_dimensions = asset.map(|a| format!("{:.0} × {:.0}", a.width, a.height));
+    let fit_value = selected_image
+        .map(|(_, props)| match props.fit {
+            ImageFit::Fill => "Fill",
+            ImageFit::Fit => "Fit",
+            ImageFit::Crop => "Crop",
+        })
+        .unwrap_or("Fill");
+
+    let on_replace_click = {
+        let replace_input_ref = replace_input_ref.clone();
+        Callback::from(move |_| {
+            if let Some(input) = replace_input_ref.cast::<HtmlInputElement>() {
+                input.click();
+            }
+        })
+    };
+
+    let on_replace_change = {
+        let editor = editor.clone();
+        let selected_image = *selected_image;
+        Callback::from(move |event: Event| {
+            let Some((id, _)) = selected_image else { return };
+            let input: HtmlInputElement = event.target_unchecked_into();
+            for file in files_from_input(&input) {
+                import_image_file(editor.clone(), file, ImportTarget::Replace { object_id: id });
+            }
+            // Clearing the input lets picking the *same* file again still
+            // fire a change event next time.
+            input.set_value("");
+        })
+    };
+
+    html! {
+        <>
+            <div class="right-panel__subsection">
+                <h3 class="right-panel__subheading">{"Image"}</h3>
+                <div class="right-panel__image-filename">{ filename }</div>
+                { if let Some(dims) = original_dimensions {
+                    html! { <div class="right-panel__image-dimensions">{ format!("Original: {dims}") }</div> }
+                } else {
+                    html! {}
+                } }
+                <button type="button" class="right-panel__replace-button" onclick={on_replace_click}>{"Replace Image"}</button>
+                <input
+                    ref={replace_input_ref}
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp"
+                    class="hidden-file-input"
+                    onchange={on_replace_change}
+                />
+            </div>
+            <div class="right-panel__subsection">
+                <h3 class="right-panel__subheading">{"Fit"}</h3>
+                { image_segmented_field(editor, selected_image, "Fit", &[("Fill", "Fill"), ("Fit", "Fit"), ("Crop", "Crop")], fit_value, |props, value| {
+                    props.fit = match value {
+                        "Fit" => ImageFit::Fit,
+                        "Crop" => ImageFit::Crop,
+                        _ => ImageFit::Fill,
+                    };
+                }) }
+            </div>
+            <div class="right-panel__subsection">
+                <h3 class="right-panel__subheading">{"Opacity"}</h3>
+                <div class="right-panel__fields right-panel__fields--single">
+                    { geometry_field(editor, selected, "Opacity", true, |g| g.opacity * 100.0, |g, v| g.opacity = (v / 100.0).clamp(0.0, 1.0)) }
+                </div>
+            </div>
+            { render_transform_section(editor, selected) }
+        </>
+    }
+}
+
 /// Properties content for a single selected non-text, non-group object
-/// (rectangle, ellipse, image placeholder): Transform + Appearance
+/// (rectangle, ellipse): Transform + Appearance
 /// (fill/stroke/opacity). No typography controls.
 fn render_shape_inspector(editor: &EditorContext, selected: Option<(ObjectId, Geometry)>) -> Html {
     html! {
@@ -579,6 +704,7 @@ fn render_align_section(editor: &EditorContext) -> Html {
 pub fn right_panel() -> Html {
     let editor = use_editor();
     let dragged = use_state(|| None::<ObjectId>);
+    let replace_image_input_ref = use_node_ref();
 
     // A group's own `geometry` is just its bounding box at creation time,
     // never kept live — never show it as if it were an editable object.
@@ -593,6 +719,14 @@ pub fn right_panel() -> Html {
         .and_then(|id| editor.document.get(id))
         .and_then(|object| match &object.kind {
             ObjectKind::Text(props) => Some((object.id, props.clone())),
+            _ => None,
+        });
+
+    let selected_image: Option<(ObjectId, ImageProperties)> = (editor.selected_ids.len() == 1)
+        .then(|| *editor.selected_ids.iter().next().unwrap())
+        .and_then(|id| editor.document.get(id))
+        .and_then(|object| match &object.kind {
+            ObjectKind::Image(props) => Some((object.id, *props)),
             _ => None,
         });
 
@@ -627,23 +761,31 @@ pub fn right_panel() -> Html {
 
             <div class={properties_class}>
                 <h2 class="right-panel__heading">{"Properties"}</h2>
-                { render_inspector(&editor, &selected, &selected_text) }
+                { render_inspector(&editor, &selected, &selected_text, &selected_image, replace_image_input_ref) }
             </div>
         </aside>
     }
 }
 
 /// Picks the one inspector that matches the current selection — the sole
-/// place that decides Empty vs. Text vs. Shape vs. MultiSelection, so
-/// nothing below Layers needs to re-derive that itself. Keyed by kind so
-/// a selection-type change replaces the subtree (rather than patching it
-/// in place), which is what lets the subtle fade below apply per-switch
-/// instead of once on first mount.
-fn render_inspector(editor: &EditorContext, selected: &Option<(ObjectId, Geometry)>, selected_text: &Option<(ObjectId, TextProperties)>) -> Html {
+/// place that decides Empty vs. Text vs. Image vs. Shape vs.
+/// MultiSelection, so nothing below Layers needs to re-derive that itself.
+/// Keyed by kind so a selection-type change replaces the subtree (rather
+/// than patching it in place), which is what lets the subtle fade below
+/// apply per-switch instead of once on first mount.
+fn render_inspector(
+    editor: &EditorContext,
+    selected: &Option<(ObjectId, Geometry)>,
+    selected_text: &Option<(ObjectId, TextProperties)>,
+    selected_image: &Option<(ObjectId, ImageProperties)>,
+    replace_image_input_ref: NodeRef,
+) -> Html {
     let (kind, content) = if editor.selected_ids.len() >= 2 {
         ("multi", render_multi_selection_inspector(editor))
     } else if selected_text.is_some() {
         ("text", render_text_inspector(editor, selected_text, *selected))
+    } else if selected_image.is_some() {
+        ("image", render_image_inspector(editor, &editor.document, selected_image, *selected, replace_image_input_ref))
     } else if selected.is_some() {
         ("shape", render_shape_inspector(editor, *selected))
     } else {

@@ -1,12 +1,13 @@
 use std::collections::BTreeSet;
 
-use web_sys::{Element, FocusEvent, HtmlTextAreaElement, InputEvent, MouseEvent};
+use web_sys::{DragEvent, Element, FocusEvent, HtmlTextAreaElement, InputEvent, MouseEvent};
 use yew::prelude::*;
 
 use crate::editor_state::{use_editor, EditorAction, EditorContext, Tool};
+use crate::image_import::{files_from_drop, import_image_file, ImportTarget};
 use crate::model::{
-    DesignDocument, DesignObject, FontStyle, FontWeight, Geometry, ObjectId, ObjectKind, TextAlign, TextProperties, TextSizeMode,
-    MIN_OBJECT_SIZE,
+    DesignDocument, DesignObject, FontStyle, FontWeight, Geometry, ImageFit, ImageProperties, ObjectId, ObjectKind, TextAlign,
+    TextProperties, TextSizeMode, DUPLICATE_OFFSET, MIN_OBJECT_SIZE,
 };
 use crate::snapping::{compute_snap, Guide, GuideOrientation};
 use crate::text_metrics;
@@ -263,13 +264,44 @@ fn canvas_point(svg_ref: &NodeRef, event: &MouseEvent) -> Option<(f64, f64)> {
     Some((x.clamp(0.0, VIEW_WIDTH), y.clamp(0.0, VIEW_HEIGHT)))
 }
 
-fn kind_icon(kind: &ObjectKind) -> &'static str {
-    match kind {
-        ObjectKind::Rectangle => "▭",
-        ObjectKind::Ellipse => "○",
-        ObjectKind::Text(_) => "T",
-        ObjectKind::ImagePlaceholder => "▨",
-        ObjectKind::Group => "▤",
+/// An image object's rendered content: a real, still-vector `<image>`
+/// element (never rasterizing the design — only this one bitmap paints as
+/// a bitmap, same as any other embedded image in an SVG), clipped to its
+/// box so `Crop` fit can't visually overflow it. Falls back to a dashed
+/// placeholder if the asset it references is missing.
+fn render_image_content(props: &ImageProperties, g: &Geometry, id: ObjectId, document: &DesignDocument) -> Html {
+    let Some(asset) = document.assets.get(props.asset_id) else {
+        return html! {
+            <>
+                <rect x="0" y="0" width={g.width.to_string()} height={g.height.to_string()} class="canvas-object__image-placeholder" />
+                <text x={(g.width / 2.0).to_string()} y={(g.height / 2.0).to_string()} dominant-baseline="middle" text-anchor="middle" class="canvas-object__image-label">
+                    {"▧"}
+                </text>
+            </>
+        };
+    };
+    let preserve_aspect_ratio = match props.fit {
+        ImageFit::Fill => "none",
+        ImageFit::Fit => "xMidYMid meet",
+        ImageFit::Crop => "xMidYMid slice",
+    };
+    let clip_id = format!("image-clip-{id}");
+
+    html! {
+        <>
+            <defs>
+                <clipPath id={clip_id.clone()}>
+                    <rect x="0" y="0" width={g.width.to_string()} height={g.height.to_string()} />
+                </clipPath>
+            </defs>
+            <image
+                href={asset.reference.clone()}
+                x="0" y="0"
+                width={g.width.to_string()} height={g.height.to_string()}
+                preserveAspectRatio={preserve_aspect_ratio}
+                clip-path={format!("url(#{clip_id})")}
+            />
+        </>
     }
 }
 
@@ -318,7 +350,15 @@ fn render_text_content(props: &TextProperties, g: &Geometry) -> Html {
 /// the same flat list) render anything. A text object currently in inline
 /// edit mode also renders nothing here — the editing textarea overlay is
 /// its sole visible/interactive surface until the session ends.
-fn render_object(object: &DesignObject, onmousedown: Callback<MouseEvent>, ondblclick: Callback<MouseEvent>, is_selected: bool, is_editing: bool) -> Html {
+#[allow(clippy::too_many_arguments)]
+fn render_object(
+    object: &DesignObject,
+    document: &DesignDocument,
+    onmousedown: Callback<MouseEvent>,
+    ondblclick: Callback<MouseEvent>,
+    is_selected: bool,
+    is_editing: bool,
+) -> Html {
     if object.kind.is_group() || is_editing {
         return html! {};
     }
@@ -352,14 +392,7 @@ fn render_object(object: &DesignObject, onmousedown: Callback<MouseEvent>, ondbl
             />
         },
         ObjectKind::Text(props) => render_text_content(props, g),
-        ObjectKind::ImagePlaceholder => html! {
-            <>
-                <rect x="0" y="0" width={g.width.to_string()} height={g.height.to_string()} class="canvas-object__image-placeholder" />
-                <text x={(g.width / 2.0).to_string()} y={(g.height / 2.0).to_string()} dominant-baseline="middle" text-anchor="middle" class="canvas-object__image-label">
-                    { kind_icon(&object.kind) }
-                </text>
-            </>
-        },
+        ObjectKind::Image(props) => render_image_content(props, g, object.id, document),
         ObjectKind::Group => html! {},
     };
 
@@ -614,6 +647,9 @@ pub fn canvas_area() -> Html {
     // started, so `CommitTextEdit` can diff against the (already live)
     // document to build one undo step covering the whole session.
     let editing_snapshot = use_state(|| None::<(ObjectId, TextProperties, Geometry)>);
+    // Whether a file is currently being dragged over the canvas — purely a
+    // transient visual cue, never touches the document.
+    let is_drag_over = use_state(|| false);
 
     {
         let editing_snapshot = editing_snapshot.clone();
@@ -905,9 +941,47 @@ pub fn canvas_area() -> Html {
         None => html! {},
     };
 
+    // Native HTML5 file drag-and-drop — a separate event family from the
+    // mousedown/move/up used for moving objects, so it can't interfere
+    // with normal object dragging. `ondragover` must call
+    // `prevent_default` or the browser refuses the drop outright.
+    let on_drag_over = {
+        let is_drag_over = is_drag_over.clone();
+        Callback::from(move |event: DragEvent| {
+            event.prevent_default();
+            if !*is_drag_over {
+                is_drag_over.set(true);
+            }
+        })
+    };
+    let on_drag_leave = {
+        let is_drag_over = is_drag_over.clone();
+        Callback::from(move |_: DragEvent| is_drag_over.set(false))
+    };
+    let on_drop = {
+        let editor = editor.clone();
+        let svg_ref = svg_ref.clone();
+        let is_drag_over = is_drag_over.clone();
+        Callback::from(move |event: DragEvent| {
+            event.prevent_default();
+            is_drag_over.set(false);
+            // `DragEvent` extends `MouseEvent` in the DOM, so it carries
+            // the same client coordinates `canvas_point` reads.
+            let center = canvas_point(&svg_ref, &event).unwrap_or((VIEW_WIDTH / 2.0, VIEW_HEIGHT / 2.0));
+            for (index, file) in files_from_drop(&event).into_iter().enumerate() {
+                let offset = index as f64 * DUPLICATE_OFFSET;
+                import_image_file(
+                    editor.clone(),
+                    file,
+                    ImportTarget::NewObject { center: (center.0 + offset, center.1 + offset) },
+                );
+            }
+        })
+    };
+
     html! {
-        <section class="canvas-area" tabindex="0">
-            <div class="canvas-area__artboard">
+        <section class="canvas-area" tabindex="0" ondragover={on_drag_over} ondragleave={on_drag_leave} ondrop={on_drop}>
+            <div class={if *is_drag_over { "canvas-area__artboard canvas-area__artboard--drag-over" } else { "canvas-area__artboard" }}>
                 <svg
                     ref={svg_ref.clone()}
                     class="canvas-area__svg"
@@ -918,6 +992,7 @@ pub fn canvas_area() -> Html {
                     onmouseup={on_pointer_up}
                 >
                     { for editor.document.objects.iter().map(|object| {
+                        let document = &editor.document;
                         let editor = editor.clone();
                         let svg_ref = svg_ref.clone();
                         let pointer_action = pointer_action.clone();
@@ -970,7 +1045,7 @@ pub fn canvas_area() -> Html {
                                 }));
                             }
                         });
-                        render_object(object, onmousedown, ondblclick, is_selected, is_editing)
+                        render_object(object, document, onmousedown, ondblclick, is_selected, is_editing)
                     }) }
                     { match &*pointer_action {
                         Some(PointerAction::CreateDraft(state)) => render_draft(state, editor.active_tool),

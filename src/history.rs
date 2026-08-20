@@ -3,7 +3,7 @@
 //! after `Geometry`, an index) — never rendered output, so this stays cheap
 //! regardless of how complex the document gets.
 
-use crate::model::{DesignDocument, DesignObject, Geometry, ObjectId, ObjectKind, TextProperties};
+use crate::model::{DesignDocument, DesignObject, Geometry, ImageProperties, ObjectId, ObjectKind, TextProperties};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
@@ -22,6 +22,9 @@ pub enum Command {
     /// own separate `SetGeometry`, batched alongside this when both change
     /// together, so this command only ever owns the text fields.
     SetTextProperties { id: ObjectId, before: TextProperties, after: TextProperties },
+    /// An image object's fit mode or asset reference changed (a Properties
+    /// panel edit, or "Replace image" — both just swap `ImageProperties`).
+    SetImageProperties { id: ObjectId, before: ImageProperties, after: ImageProperties },
     /// One or more objects were reparented (grouping/ungrouping).
     SetParent { changes: Vec<(ObjectId, Option<ObjectId>, Option<ObjectId>)> },
     /// An object moved to a different position in document (z-)order, e.g.
@@ -48,6 +51,11 @@ impl Command {
             Command::SetTextProperties { id, after, .. } => {
                 if let Some(object) = document.get_mut(*id) {
                     object.kind = ObjectKind::Text(after.clone());
+                }
+            }
+            Command::SetImageProperties { id, after, .. } => {
+                if let Some(object) = document.get_mut(*id) {
+                    object.kind = ObjectKind::Image(*after);
                 }
             }
             Command::SetParent { changes } => {
@@ -88,6 +96,11 @@ impl Command {
                     object.kind = ObjectKind::Text(before.clone());
                 }
             }
+            Command::SetImageProperties { id, before, .. } => {
+                if let Some(object) = document.get_mut(*id) {
+                    object.kind = ObjectKind::Image(*before);
+                }
+            }
             Command::SetParent { changes } => {
                 for (id, before, _) in changes {
                     if let Some(object) = document.get_mut(*id) {
@@ -114,6 +127,7 @@ impl Command {
             Command::DeleteObjects { removed } => removed.iter().map(|(_, o)| o.id).collect(),
             Command::SetGeometry { id, .. } => vec![*id],
             Command::SetTextProperties { id, .. } => vec![*id],
+            Command::SetImageProperties { id, .. } => vec![*id],
             Command::SetParent { changes } => changes.iter().map(|(id, ..)| *id).collect(),
             Command::Reorder { id, .. } => vec![*id],
             Command::Batch(commands) => commands.iter().flat_map(Command::affected_ids).collect(),

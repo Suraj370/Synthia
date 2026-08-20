@@ -13,7 +13,16 @@
 
 use std::collections::HashMap;
 
+use crate::asset_manager::{AssetId, AssetManager};
+
 pub type ObjectId = u64;
+
+/// Bumped whenever the document's shape changes in a way a future
+/// load/save path would need to migrate around. Nothing reads or writes a
+/// document to disk yet, so this has no behavior today — it exists so
+/// that whenever persistence lands, "what format is this" is already a
+/// question the model can answer.
+pub const DOCUMENT_FORMAT_VERSION: u32 = 1;
 
 /// The smallest width/height an object may have. Enforced everywhere a
 /// geometry is written (interactive resize, Properties panel edits) so the
@@ -53,7 +62,7 @@ pub enum ObjectKind {
     Rectangle,
     Ellipse,
     Text(TextProperties),
-    ImagePlaceholder,
+    Image(ImageProperties),
     /// A pure container: has no shape of its own. Its children (objects
     /// whose `parent_id` points at it) render normally in their own list
     /// position; the group only exists so selection/move can treat them as
@@ -67,7 +76,7 @@ impl ObjectKind {
             ObjectKind::Rectangle => "Rectangle",
             ObjectKind::Ellipse => "Ellipse",
             ObjectKind::Text(_) => "Text",
-            ObjectKind::ImagePlaceholder => "Image",
+            ObjectKind::Image(_) => "Image",
             ObjectKind::Group => "Group",
         }
     }
@@ -270,6 +279,32 @@ impl Default for TextProperties {
     }
 }
 
+/// How an image's pixels map onto its (possibly different-aspect-ratio)
+/// on-canvas box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ImageFit {
+    /// Stretches to exactly fill the box, ignoring aspect ratio.
+    #[default]
+    Fill,
+    /// Scales to fit entirely inside the box, preserving aspect ratio
+    /// (may letterbox).
+    Fit,
+    /// Scales to cover the box, preserving aspect ratio, cropping
+    /// whatever overflows.
+    Crop,
+}
+
+/// Everything about an image object that isn't its transform — mirrors
+/// `TextProperties`: the object's `Geometry` still owns position/size/
+/// rotation/opacity, this only owns what's specific to being an image.
+/// Deliberately just a reference (`asset_id`) rather than pixel data —
+/// see `asset_manager.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageProperties {
+    pub asset_id: AssetId,
+    pub fit: ImageFit,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DesignObject {
     pub id: ObjectId,
@@ -281,10 +316,25 @@ pub struct DesignObject {
     pub parent_id: Option<ObjectId>,
 }
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DesignDocument {
     pub objects: Vec<DesignObject>,
+    /// Local image data referenced by any `ObjectKind::Image` in
+    /// `objects` via its `asset_id` — see `asset_manager.rs`.
+    pub assets: AssetManager,
+    pub version: u32,
     next_id: ObjectId,
+}
+
+impl Default for DesignDocument {
+    fn default() -> Self {
+        Self {
+            objects: Vec::new(),
+            assets: AssetManager::default(),
+            version: DOCUMENT_FORMAT_VERSION,
+            next_id: 0,
+        }
+    }
 }
 
 impl DesignDocument {
