@@ -16,12 +16,22 @@
 //! need to change what `image_import.rs` puts in this field — everything
 //! downstream (the document, the renderer, history) is already agnostic
 //! to where the string points.
+//!
+//! That tradeoff does mean `reference` doesn't survive a save/reopen: a
+//! browser object URL is only valid for the session that created it. Save
+//! (`document_io.rs`) still writes every asset's metadata faithfully (so
+//! the format round-trips completely and the object/geometry/filename are
+//! all intact), but a reopened file's images will render blank until
+//! re-imported, until a real on-disk asset store lands — a known,
+//! disclosed gap, not a silent one.
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 pub type AssetId = u64;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Asset {
     pub id: AssetId,
     pub filename: String,
@@ -34,7 +44,7 @@ pub struct Asset {
     pub reference: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct AssetManager {
     assets: HashMap<AssetId, Asset>,
     next_id: AssetId,

@@ -3,11 +3,12 @@ use std::collections::BTreeSet;
 use web_sys::{DragEvent, HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
 
+use crate::components::color_picker::ColorField;
 use crate::editor_state::{use_editor, AlignMode, DistributeAxis, EditorAction, EditorContext};
 use crate::image_import::{files_from_input, import_image_file, ImportTarget};
 use crate::model::{
-    DesignDocument, FontFamily, FontStyle, FontWeight, Geometry, ImageFit, ImageProperties, ObjectId, ObjectKind, TextAlign,
-    TextDecoration, TextProperties, MIN_OBJECT_SIZE,
+    Color, DesignDocument, FontFamily, FontStyle, FontWeight, Geometry, ImageFit, ImageProperties, LineProperties, ObjectId, ObjectKind,
+    PathProperties, ShapeProperties, Stroke, TextAlign, TextDecoration, TextProperties, MIN_OBJECT_SIZE,
 };
 
 fn format_number(value: f64) -> String {
@@ -30,8 +31,10 @@ fn format_number_precise(value: f64, precision: usize) -> String {
 
 fn kind_icon(kind: &ObjectKind) -> &'static str {
     match kind {
-        ObjectKind::Rectangle => "▭",
-        ObjectKind::Ellipse => "○",
+        ObjectKind::Rectangle(_) => "▭",
+        ObjectKind::Ellipse(_) => "○",
+        ObjectKind::Line(_) => "╱",
+        ObjectKind::Path(_) => "✎",
         ObjectKind::Text(_) => "T",
         ObjectKind::Image(_) => "▧",
         ObjectKind::Group => "▤",
@@ -109,19 +112,6 @@ fn geometry_field(
         }
     });
     render_field(label, value, selected.is_none(), wide, on_commit)
-}
-
-/// A non-interactive appearance swatch. There's no per-object fill/stroke
-/// data in the model yet, so this reflects the one fixed color every shape
-/// actually renders with — honest about not being editable rather than
-/// faking a control with nothing behind it.
-fn render_swatch_row(label: &'static str, color: &str) -> Html {
-    html! {
-        <div class="right-panel__swatch-row">
-            <span class="right-panel__field-label">{label}</span>
-            <span class="right-panel__swatch" style={format!("background-color: {color}")}></span>
-        </div>
-    }
 }
 
 /// A `<select>`-backed Properties field bound to one text property: `get`
@@ -228,28 +218,47 @@ fn text_number_field(
     render_field_precise(label, value, disabled, wide, precision, on_commit)
 }
 
-/// The Fill color control for text — unlike `render_swatch_row` (which is
-/// just an honest placeholder for kinds with no real per-object color
-/// data yet), text objects do have a real `fill`, so this is a working
-/// `<input type="color">` bound to it.
+/// The Fill color control for text — the same `ColorField` popover shape
+/// and stroke use, bound to `TextProperties.fill`. A drag inside the
+/// popover updates the document live via `UpdateTextProperties` (mirrors
+/// how an active edit session streams keystrokes, unrecorded); releasing
+/// it — or a hex/RGB field edit, or the eyedropper — commits one step via
+/// `CommitTextProperties`.
 fn text_fill_field(editor: &EditorContext, selected: &Option<(ObjectId, TextProperties)>) -> Html {
-    let value = selected.as_ref().map(|(_, props)| props.fill.clone()).unwrap_or_else(|| "#000000".to_string());
-    let disabled = selected.is_none();
-    let editor = editor.clone();
-    let selected = selected.clone();
-    let onchange = Callback::from(move |event: Event| {
-        let input: HtmlInputElement = event.target_unchecked_into();
-        if let Some((id, before)) = &selected {
-            let mut after = before.clone();
-            after.fill = input.value();
-            editor.dispatch(EditorAction::CommitTextProperties { id: *id, before: before.clone(), after });
-        }
-    });
+    let color = selected.as_ref().map(|(_, props)| props.fill);
+
+    let on_live = {
+        let editor = editor.clone();
+        let selected = selected.clone();
+        Callback::from(move |color: Color| {
+            if let Some((id, before)) = &selected {
+                let mut properties = before.clone();
+                properties.fill = color;
+                editor.dispatch(EditorAction::UpdateTextProperties { id: *id, properties });
+            }
+        })
+    };
+
+    let on_commit = {
+        let editor = editor.clone();
+        let selected = selected.clone();
+        Callback::from(move |(before_color, after_color): (Color, Color)| {
+            if let Some((id, before)) = &selected {
+                let mut before_props = before.clone();
+                before_props.fill = before_color;
+                let mut after_props = before.clone();
+                after_props.fill = after_color;
+                editor.dispatch(EditorAction::CommitTextProperties { id: *id, before: before_props, after: after_props });
+            }
+        })
+    };
+
+    let key = selected.as_ref().map(|(id, _)| id.to_string()).unwrap_or_default();
 
     html! {
         <div class="right-panel__swatch-row">
             <span class="right-panel__field-label">{"Fill"}</span>
-            <input type="color" class="right-panel__color-input" {value} {disabled} {onchange} />
+            <ColorField {key} label="" {color} {on_live} {on_commit} />
         </div>
     }
 }
@@ -492,17 +501,296 @@ fn render_image_inspector(
     }
 }
 
+/// The Fill color control for a rectangle/ellipse — same `ColorField`
+/// popover as text's Fill, bound to `ShapeProperties.fill` via
+/// `UpdateShapeProperties` (live, during a picker drag) and
+/// `CommitShapeProperties` (one undo step per drag/field edit).
+fn shape_fill_field(editor: &EditorContext, selected: &Option<(ObjectId, ShapeProperties)>) -> Html {
+    let color = selected.as_ref().map(|(_, props)| props.fill);
+
+    let on_live = {
+        let editor = editor.clone();
+        let selected = *selected;
+        Callback::from(move |color: Color| {
+            if let Some((id, before)) = selected {
+                let mut properties = before;
+                properties.fill = color;
+                editor.dispatch(EditorAction::UpdateShapeProperties { id, properties });
+            }
+        })
+    };
+
+    let on_commit = {
+        let editor = editor.clone();
+        let selected = *selected;
+        Callback::from(move |(before_color, after_color): (Color, Color)| {
+            if let Some((id, before)) = selected {
+                let before_props = ShapeProperties { fill: before_color, ..before };
+                let after_props = ShapeProperties { fill: after_color, ..before };
+                editor.dispatch(EditorAction::CommitShapeProperties { id, before: before_props, after: after_props });
+            }
+        })
+    };
+
+    let key = selected.as_ref().map(|(id, _)| id.to_string()).unwrap_or_default();
+
+    html! {
+        <div class="right-panel__swatch-row">
+            <span class="right-panel__field-label">{"Fill"}</span>
+            <ColorField {key} label="" {color} {on_live} {on_commit} />
+        </div>
+    }
+}
+
+/// The Stroke color control — same shape as `shape_fill_field`, bound to
+/// `ShapeProperties.stroke.color`. Disabled (independently of whether an
+/// object is even selected) whenever `stroke.enabled` is off, so it's
+/// visibly inert rather than silently editing a color nothing renders.
+fn shape_stroke_color_field(editor: &EditorContext, selected: &Option<(ObjectId, ShapeProperties)>) -> Html {
+    let color = selected.as_ref().map(|(_, props)| props.stroke.color);
+    let disabled = selected.as_ref().map(|(_, props)| !props.stroke.enabled).unwrap_or(true);
+
+    let on_live = {
+        let editor = editor.clone();
+        let selected = *selected;
+        Callback::from(move |color: Color| {
+            if let Some((id, before)) = selected {
+                let mut properties = before;
+                properties.stroke.color = color;
+                editor.dispatch(EditorAction::UpdateShapeProperties { id, properties });
+            }
+        })
+    };
+
+    let on_commit = {
+        let editor = editor.clone();
+        let selected = *selected;
+        Callback::from(move |(before_color, after_color): (Color, Color)| {
+            if let Some((id, before)) = selected {
+                let mut before_props = before;
+                before_props.stroke.color = before_color;
+                let mut after_props = before;
+                after_props.stroke.color = after_color;
+                editor.dispatch(EditorAction::CommitShapeProperties { id, before: before_props, after: after_props });
+            }
+        })
+    };
+
+    let key = selected.as_ref().map(|(id, _)| id.to_string()).unwrap_or_default();
+
+    html! {
+        <div class="right-panel__swatch-row">
+            <span class="right-panel__field-label">{"Color"}</span>
+            <ColorField {key} label="" {color} {on_live} {on_commit} {disabled} />
+        </div>
+    }
+}
+
+/// The Stroke width field — same numeric-field pattern as every other
+/// Properties field, bound to `ShapeProperties.stroke.width`.
+fn shape_stroke_width_field(editor: &EditorContext, selected: &Option<(ObjectId, ShapeProperties)>) -> Html {
+    let value = selected.as_ref().map(|(_, props)| props.stroke.width);
+    let disabled = selected.as_ref().map(|(_, props)| !props.stroke.enabled).unwrap_or(true);
+    let editor = editor.clone();
+    let selected = *selected;
+    let on_commit = Callback::from(move |input: f64| {
+        if let Some((id, before)) = selected {
+            let after = ShapeProperties { stroke: Stroke { width: input.max(0.0), ..before.stroke }, ..before };
+            editor.dispatch(EditorAction::CommitShapeProperties { id, before, after });
+        }
+    });
+    render_field("Width", value, disabled, false, on_commit)
+}
+
+/// The Stroke on/off toggle — kept as a flag on `ShapeProperties.stroke`
+/// rather than an `Option<Stroke>` (see `model.rs`), so switching it off
+/// and back on doesn't discard the color/width already dialed in.
+fn shape_stroke_toggle(editor: &EditorContext, selected: &Option<(ObjectId, ShapeProperties)>) -> Html {
+    let checked = selected.as_ref().map(|(_, props)| props.stroke.enabled).unwrap_or(false);
+    let disabled = selected.is_none();
+    let editor = editor.clone();
+    let selected = *selected;
+    let onchange = Callback::from(move |_: Event| {
+        if let Some((id, before)) = selected {
+            let after = ShapeProperties { stroke: Stroke { enabled: !before.stroke.enabled, ..before.stroke }, ..before };
+            editor.dispatch(EditorAction::CommitShapeProperties { id, before, after });
+        }
+    });
+    html! { <input type="checkbox" class="right-panel__checkbox" {checked} {disabled} {onchange} /> }
+}
+
 /// Properties content for a single selected non-text, non-group object
-/// (rectangle, ellipse): Transform + Appearance
-/// (fill/stroke/opacity). No typography controls.
-fn render_shape_inspector(editor: &EditorContext, selected: Option<(ObjectId, Geometry)>) -> Html {
+/// (rectangle, ellipse): Transform + Fill + Stroke + Opacity.
+fn render_shape_inspector(editor: &EditorContext, selected: Option<(ObjectId, Geometry)>, selected_shape: &Option<(ObjectId, ShapeProperties)>) -> Html {
     html! {
         <>
             { render_transform_section(editor, selected) }
             <div class="right-panel__subsection">
-                <h3 class="right-panel__subheading">{"Appearance"}</h3>
-                { render_swatch_row("Fill", "var(--bg-raised)") }
-                { render_swatch_row("Stroke", "var(--border-strong)") }
+                <h3 class="right-panel__subheading">{"Fill"}</h3>
+                { shape_fill_field(editor, selected_shape) }
+            </div>
+            <div class="right-panel__subsection">
+                <div class="right-panel__subheading-row">
+                    <h3 class="right-panel__subheading">{"Stroke"}</h3>
+                    { shape_stroke_toggle(editor, selected_shape) }
+                </div>
+                { shape_stroke_color_field(editor, selected_shape) }
+                <div class="right-panel__fields right-panel__fields--single">
+                    { shape_stroke_width_field(editor, selected_shape) }
+                </div>
+            </div>
+            <div class="right-panel__subsection">
+                <h3 class="right-panel__subheading">{"Opacity"}</h3>
+                <div class="right-panel__fields right-panel__fields--single">
+                    { geometry_field(editor, selected, "Opacity", true, |g| g.opacity * 100.0, |g, v| g.opacity = (v / 100.0).clamp(0.0, 1.0)) }
+                </div>
+            </div>
+        </>
+    }
+}
+
+/// The Stroke color control for a line — same `ColorField` pattern as
+/// `shape_stroke_color_field`, bound to `LineProperties.stroke_color`. A
+/// line has no fill/enabled-toggle (see `model.rs`), so this is always
+/// enabled whenever a line is selected.
+fn line_stroke_color_field(editor: &EditorContext, selected: &Option<(ObjectId, LineProperties)>) -> Html {
+    let color = selected.as_ref().map(|(_, props)| props.stroke_color);
+
+    let on_live = {
+        let editor = editor.clone();
+        let selected = *selected;
+        Callback::from(move |color: Color| {
+            if let Some((id, before)) = selected {
+                let properties = LineProperties { stroke_color: color, ..before };
+                editor.dispatch(EditorAction::UpdateLineProperties { id, properties });
+            }
+        })
+    };
+
+    let on_commit = {
+        let editor = editor.clone();
+        let selected = *selected;
+        Callback::from(move |(before_color, after_color): (Color, Color)| {
+            if let Some((id, before)) = selected {
+                let before_props = LineProperties { stroke_color: before_color, ..before };
+                let after_props = LineProperties { stroke_color: after_color, ..before };
+                editor.dispatch(EditorAction::CommitLineProperties { id, before: before_props, after: after_props });
+            }
+        })
+    };
+
+    let key = selected.as_ref().map(|(id, _)| id.to_string()).unwrap_or_default();
+
+    html! {
+        <div class="right-panel__swatch-row">
+            <span class="right-panel__field-label">{"Color"}</span>
+            <ColorField {key} label="" {color} {on_live} {on_commit} />
+        </div>
+    }
+}
+
+/// The Stroke width field for a line, bound to `LineProperties.stroke_width`.
+fn line_stroke_width_field(editor: &EditorContext, selected: &Option<(ObjectId, LineProperties)>) -> Html {
+    let value = selected.as_ref().map(|(_, props)| props.stroke_width);
+    let disabled = selected.is_none();
+    let editor = editor.clone();
+    let selected = *selected;
+    let on_commit = Callback::from(move |input: f64| {
+        if let Some((id, before)) = selected {
+            let after = LineProperties { stroke_width: input.max(0.0), ..before };
+            editor.dispatch(EditorAction::CommitLineProperties { id, before, after });
+        }
+    });
+    render_field("Width", value, disabled, false, on_commit)
+}
+
+/// Properties content for a single selected line: Transform + Stroke
+/// (color, width, opacity). No Fill section — a line has nothing to fill.
+fn render_line_inspector(editor: &EditorContext, selected: Option<(ObjectId, Geometry)>, selected_line: &Option<(ObjectId, LineProperties)>) -> Html {
+    html! {
+        <>
+            { render_transform_section(editor, selected) }
+            <div class="right-panel__subsection">
+                <h3 class="right-panel__subheading">{"Stroke"}</h3>
+                { line_stroke_color_field(editor, selected_line) }
+                <div class="right-panel__fields">
+                    { line_stroke_width_field(editor, selected_line) }
+                    { geometry_field(editor, selected, "Opacity", false, |g| g.opacity * 100.0, |g, v| g.opacity = (v / 100.0).clamp(0.0, 1.0)) }
+                </div>
+            </div>
+        </>
+    }
+}
+
+/// The Stroke color control for a freehand path — mirrors
+/// `line_stroke_color_field`, bound to `PathProperties.stroke_color`.
+fn path_stroke_color_field(editor: &EditorContext, selected: &Option<(ObjectId, PathProperties)>) -> Html {
+    let color = selected.as_ref().map(|(_, props)| props.stroke_color);
+
+    let on_live = {
+        let editor = editor.clone();
+        let selected = selected.clone();
+        Callback::from(move |color: Color| {
+            if let Some((id, before)) = &selected {
+                let properties = PathProperties { stroke_color: color, ..before.clone() };
+                editor.dispatch(EditorAction::UpdatePathProperties { id: *id, properties });
+            }
+        })
+    };
+
+    let on_commit = {
+        let editor = editor.clone();
+        let selected = selected.clone();
+        Callback::from(move |(before_color, after_color): (Color, Color)| {
+            if let Some((id, before)) = &selected {
+                let before_props = PathProperties { stroke_color: before_color, ..before.clone() };
+                let after_props = PathProperties { stroke_color: after_color, ..before.clone() };
+                editor.dispatch(EditorAction::CommitPathProperties { id: *id, before: before_props, after: after_props });
+            }
+        })
+    };
+
+    let key = selected.as_ref().map(|(id, _)| id.to_string()).unwrap_or_default();
+
+    html! {
+        <div class="right-panel__swatch-row">
+            <span class="right-panel__field-label">{"Color"}</span>
+            <ColorField {key} label="" {color} {on_live} {on_commit} />
+        </div>
+    }
+}
+
+/// The Stroke width field for a freehand path, bound to
+/// `PathProperties.stroke_width`.
+fn path_stroke_width_field(editor: &EditorContext, selected: &Option<(ObjectId, PathProperties)>) -> Html {
+    let value = selected.as_ref().map(|(_, props)| props.stroke_width);
+    let disabled = selected.is_none();
+    let editor = editor.clone();
+    let selected = selected.clone();
+    let on_commit = Callback::from(move |input: f64| {
+        if let Some((id, before)) = &selected {
+            let after = PathProperties { stroke_width: input.max(0.0), ..before.clone() };
+            editor.dispatch(EditorAction::CommitPathProperties { id: *id, before: before.clone(), after });
+        }
+    });
+    render_field("Width", value, disabled, false, on_commit)
+}
+
+/// Properties content for a single selected freehand path: Transform +
+/// Stroke (color, width) + Opacity. No Fill — a path is never filled.
+fn render_path_inspector(editor: &EditorContext, selected: Option<(ObjectId, Geometry)>, selected_path: &Option<(ObjectId, PathProperties)>) -> Html {
+    html! {
+        <>
+            { render_transform_section(editor, selected) }
+            <div class="right-panel__subsection">
+                <h3 class="right-panel__subheading">{"Stroke"}</h3>
+                { path_stroke_color_field(editor, selected_path) }
+                <div class="right-panel__fields right-panel__fields--single">
+                    { path_stroke_width_field(editor, selected_path) }
+                </div>
+            </div>
+            <div class="right-panel__subsection">
+                <h3 class="right-panel__subheading">{"Opacity"}</h3>
                 <div class="right-panel__fields right-panel__fields--single">
                     { geometry_field(editor, selected, "Opacity", true, |g| g.opacity * 100.0, |g, v| g.opacity = (v / 100.0).clamp(0.0, 1.0)) }
                 </div>
@@ -730,6 +1018,30 @@ pub fn right_panel() -> Html {
             _ => None,
         });
 
+    let selected_shape: Option<(ObjectId, ShapeProperties)> = (editor.selected_ids.len() == 1)
+        .then(|| *editor.selected_ids.iter().next().unwrap())
+        .and_then(|id| editor.document.get(id))
+        .and_then(|object| match &object.kind {
+            ObjectKind::Rectangle(props) | ObjectKind::Ellipse(props) => Some((object.id, *props)),
+            _ => None,
+        });
+
+    let selected_line: Option<(ObjectId, LineProperties)> = (editor.selected_ids.len() == 1)
+        .then(|| *editor.selected_ids.iter().next().unwrap())
+        .and_then(|id| editor.document.get(id))
+        .and_then(|object| match &object.kind {
+            ObjectKind::Line(props) => Some((object.id, *props)),
+            _ => None,
+        });
+
+    let selected_path: Option<(ObjectId, PathProperties)> = (editor.selected_ids.len() == 1)
+        .then(|| *editor.selected_ids.iter().next().unwrap())
+        .and_then(|id| editor.document.get(id))
+        .and_then(|object| match &object.kind {
+            ObjectKind::Path(props) => Some((object.id, props.clone())),
+            _ => None,
+        });
+
     let layer_rows = render_layer_rows(&editor.document, &editor, &dragged, None, 0);
 
     // A single text selection takes over the whole sidebar — Layers makes
@@ -761,7 +1073,7 @@ pub fn right_panel() -> Html {
 
             <div class={properties_class}>
                 <h2 class="right-panel__heading">{"Properties"}</h2>
-                { render_inspector(&editor, &selected, &selected_text, &selected_image, replace_image_input_ref) }
+                { render_inspector(&editor, &selected, &selected_text, &selected_image, &selected_shape, &selected_line, &selected_path, replace_image_input_ref) }
             </div>
         </aside>
     }
@@ -773,11 +1085,15 @@ pub fn right_panel() -> Html {
 /// Keyed by kind so a selection-type change replaces the subtree (rather
 /// than patching it in place), which is what lets the subtle fade below
 /// apply per-switch instead of once on first mount.
+#[allow(clippy::too_many_arguments)]
 fn render_inspector(
     editor: &EditorContext,
     selected: &Option<(ObjectId, Geometry)>,
     selected_text: &Option<(ObjectId, TextProperties)>,
     selected_image: &Option<(ObjectId, ImageProperties)>,
+    selected_shape: &Option<(ObjectId, ShapeProperties)>,
+    selected_line: &Option<(ObjectId, LineProperties)>,
+    selected_path: &Option<(ObjectId, PathProperties)>,
     replace_image_input_ref: NodeRef,
 ) -> Html {
     let (kind, content) = if editor.selected_ids.len() >= 2 {
@@ -786,8 +1102,12 @@ fn render_inspector(
         ("text", render_text_inspector(editor, selected_text, *selected))
     } else if selected_image.is_some() {
         ("image", render_image_inspector(editor, &editor.document, selected_image, *selected, replace_image_input_ref))
-    } else if selected.is_some() {
-        ("shape", render_shape_inspector(editor, *selected))
+    } else if selected_shape.is_some() {
+        ("shape", render_shape_inspector(editor, *selected, selected_shape))
+    } else if selected_line.is_some() {
+        ("line", render_line_inspector(editor, *selected, selected_line))
+    } else if selected_path.is_some() {
+        ("path", render_path_inspector(editor, *selected, selected_path))
     } else {
         ("empty", render_empty_inspector())
     };

@@ -10,7 +10,8 @@ use yew::prelude::*;
 
 use crate::history::{batch, Command, History};
 use crate::model::{
-    DesignDocument, DesignObject, Geometry, ImageFit, ImageProperties, ObjectId, ObjectKind, TextProperties, TextSizeMode, DUPLICATE_OFFSET,
+    DesignDocument, DesignObject, Geometry, ImageFit, ImageProperties, LineProperties, ObjectId, ObjectKind, PathProperties,
+    ShapeProperties, TextProperties, TextSizeMode, DUPLICATE_OFFSET, MIN_CANVAS_SIZE,
 };
 
 /// An imported image is scaled down (never up) so its larger dimension is
@@ -18,6 +19,10 @@ use crate::model::{
 /// the canvas" for an 800x600 artboard, while an already-small image keeps
 /// its natural size.
 const IMPORT_MAX_DIMENSION: f64 = 360.0;
+
+pub const MIN_ZOOM: f64 = 0.1;
+pub const MAX_ZOOM: f64 = 8.0;
+pub const DEFAULT_ZOOM: f64 = 1.0;
 
 /// The display (width, height) for a freshly imported image, preserving
 /// its natural aspect ratio.
@@ -57,7 +62,7 @@ pub enum DistributeAxis {
     Vertical,
 }
 
-#[derive(Clone, PartialEq, Default)]
+#[derive(Clone, PartialEq)]
 pub struct EditorState {
     pub document: DesignDocument,
     pub selected_ids: BTreeSet<ObjectId>,
@@ -73,6 +78,53 @@ pub struct EditorState {
     /// content/property changes made during the session are what get
     /// recorded, as one step, when it ends.
     pub editing_text: Option<ObjectId>,
+    /// Whether `document` differs from what's on disk (or, for a never-
+    /// saved document, from blank). Derived automatically at the end of
+    /// every `reduce` from whether `history`'s undo stack just changed —
+    /// see the end of `reduce` for why that's an exact signal — rather
+    /// than flagged by hand in each action, so no future action can
+    /// forget to set it.
+    pub is_dirty: bool,
+    /// View-only — never persisted, never affects `is_dirty`, never
+    /// touches `document`. 1.0 = 100%. While `fit_mode` is on, this is kept
+    /// numerically in sync with the live-computed fit zoom (see
+    /// `canvas_area.rs`) purely so every reader (status bar, toolbar) can
+    /// keep reading this one field regardless of which mode produced it.
+    pub zoom: f64,
+    /// Whether the viewport should continuously recompute `zoom` so the
+    /// whole document fits the canvas workspace (recalculated on window
+    /// resize and on canvas size changes), as opposed to a `zoom` the user
+    /// set explicitly. Same "view-only" status as `zoom` itself: never
+    /// persisted, never undoable. Any manual zoom action (`SetZoom`) turns
+    /// this off; `SetFitMode(true)` (the toolbar's Fit button) turns it
+    /// back on.
+    pub fit_mode: bool,
+    /// Where `document` was last saved to or opened from, if anywhere.
+    /// `None` for a never-saved document — Save shows the file dialog in
+    /// that case, Save As always does.
+    pub file_path: Option<String>,
+    /// What the toolbar shows for the document's name — "Untitled" until
+    /// the first successful save/open, then the file's name.
+    pub document_title: String,
+}
+
+impl Default for EditorState {
+    fn default() -> Self {
+        Self {
+            document: DesignDocument::default(),
+            selected_ids: BTreeSet::default(),
+            active_tool: Tool::default(),
+            history: History::default(),
+            clipboard: Vec::default(),
+            expanded_groups: BTreeSet::default(),
+            editing_text: None,
+            is_dirty: false,
+            zoom: DEFAULT_ZOOM,
+            fit_mode: true,
+            file_path: None,
+            document_title: "Untitled".to_string(),
+        }
+    }
 }
 
 impl EditorState {
@@ -145,6 +197,24 @@ pub enum EditorAction {
     /// One immediate, undoable image-property change from a Properties
     /// panel field (fit mode) — not a new asset.
     CommitImageProperties { id: ObjectId, before: ImageProperties, after: ImageProperties },
+    /// Live fill/stroke update during an active color-picker drag (the
+    /// saturation/value area, hue slider, or alpha slider) — applied to the
+    /// document immediately but NOT recorded to history, the same way
+    /// `UpdateGeometry` works for a move/resize drag.
+    UpdateShapeProperties { id: ObjectId, properties: ShapeProperties },
+    /// One immediate, undoable fill/stroke change — a Properties panel
+    /// field edit, or the single step recorded when a color-picker drag
+    /// gesture ends.
+    CommitShapeProperties { id: ObjectId, before: ShapeProperties, after: ShapeProperties },
+    /// Live stroke update during an active color-picker drag on a line —
+    /// same "applied but not recorded" pattern as `UpdateShapeProperties`.
+    UpdateLineProperties { id: ObjectId, properties: LineProperties },
+    /// One immediate, undoable line stroke-color/width change.
+    CommitLineProperties { id: ObjectId, before: LineProperties, after: LineProperties },
+    /// Live stroke update during an active color-picker drag on a path.
+    UpdatePathProperties { id: ObjectId, properties: PathProperties },
+    /// One immediate, undoable path stroke-color/width change.
+    CommitPathProperties { id: ObjectId, before: PathProperties, after: PathProperties },
     /// "Replace image": registers the freshly decoded file as a new asset
     /// and points `id`'s existing image object at it, leaving its
     /// transform untouched. One undo step.
@@ -158,6 +228,46 @@ pub enum EditorAction {
     },
     Undo,
     Redo,
+    /// Resets to a fresh blank document. Never shown directly to a dirty
+    /// document without the caller (the New button) having already
+    /// resolved the "unsaved changes" prompt.
+    NewDocument,
+    /// Replaces the document wholesale with one just read from disk.
+    /// `path`/`filename` become the new save target/title.
+    LoadDocument { document: DesignDocument, path: String, filename: String },
+    /// Records where a save just went, without touching the document
+    /// itself — used after both Save and Save As succeed.
+    MarkSaved { path: String, filename: String },
+    /// Absolute zoom level (clamped to `[MIN_ZOOM, MAX_ZOOM]`) — every
+    /// *manual* zoom entry point (buttons, presets, wheel, fit-to-selection)
+    /// computes its target level and dispatches this rather than each
+    /// having its own action. Always turns `fit_mode` off — the user just
+    /// asked for a specific zoom, so the viewport should stop overriding it.
+    SetZoom(f64),
+    /// Turns Fit mode on (the toolbar's Fit button, or the zoom menu's "Fit
+    /// to screen") or off. Turning it on doesn't itself compute a zoom
+    /// level — `canvas_area.rs` reacts to `fit_mode` being true by
+    /// measuring the live workspace and dispatching `SyncFitZoom`.
+    SetFitMode(bool),
+    /// Internal: keeps `zoom` numerically in sync with the live-computed
+    /// fit zoom while `fit_mode` is on. Unlike `SetZoom`, this does NOT
+    /// touch `fit_mode` — it's the mechanism fit mode uses to update the
+    /// displayed zoom, not a manual override of it.
+    SyncFitZoom(f64),
+    /// Resizes the document canvas (Canvas Size panel field edit or a
+    /// preset), clamped to `MIN_CANVAS_SIZE`. When `scale_content` is set,
+    /// every object's geometry is scaled proportionally along with it, as
+    /// part of the same undo step; otherwise objects are left exactly
+    /// where they are — only the canvas itself changes.
+    SetCanvasSize { width: f64, height: f64, scale_content: bool },
+    /// Live background-color update during an active color-picker drag —
+    /// applied to the document immediately but NOT recorded to history,
+    /// the same "live vs. commit" split every other color field uses.
+    UpdateBackground(String),
+    /// One immediate, undoable background-color change — a hex/RGB field
+    /// edit, the eyedropper, or the single step recorded when a
+    /// color-picker drag gesture ends.
+    CommitBackground { before: String, after: String },
 }
 
 /// Writes `properties` onto `id`'s `ObjectKind::Text`, and — for
@@ -251,7 +361,12 @@ impl Reducible for EditorState {
     type Action = EditorAction;
 
     fn reduce(self: Rc<Self>, action: Self::Action) -> Rc<Self> {
+        let history_before = self.history.undo_count();
         let mut next = (*self).clone();
+        // `Some(v)` for actions that need to force a specific dirty state
+        // (New/Load/MarkSaved) rather than let the generic undo-stack
+        // check below decide it.
+        let mut force_dirty: Option<bool> = None;
         match action {
             EditorAction::SetActiveTool(tool) => {
                 next.active_tool = tool;
@@ -561,6 +676,61 @@ impl Reducible for EditorState {
                 }
             }
 
+            EditorAction::UpdateShapeProperties { id, properties } => {
+                if let Some(object) = next.document.get_mut(id) {
+                    match &mut object.kind {
+                        ObjectKind::Rectangle(props) | ObjectKind::Ellipse(props) => *props = properties,
+                        _ => {}
+                    }
+                }
+            }
+
+            EditorAction::CommitShapeProperties { id, before, after } => {
+                if before != after {
+                    if let Some(object) = next.document.get_mut(id) {
+                        match &mut object.kind {
+                            ObjectKind::Rectangle(props) | ObjectKind::Ellipse(props) => *props = after,
+                            _ => {}
+                        }
+                    }
+                    next.history.record(Command::SetShapeProperties { id, before, after });
+                }
+            }
+
+            EditorAction::UpdateLineProperties { id, properties } => {
+                if let Some(object) = next.document.get_mut(id) {
+                    if matches!(object.kind, ObjectKind::Line(_)) {
+                        object.kind = ObjectKind::Line(properties);
+                    }
+                }
+            }
+
+            EditorAction::CommitLineProperties { id, before, after } => {
+                if before != after {
+                    if let Some(object) = next.document.get_mut(id) {
+                        object.kind = ObjectKind::Line(after);
+                    }
+                    next.history.record(Command::SetLineProperties { id, before, after });
+                }
+            }
+
+            EditorAction::UpdatePathProperties { id, properties } => {
+                if let Some(object) = next.document.get_mut(id) {
+                    if matches!(object.kind, ObjectKind::Path(_)) {
+                        object.kind = ObjectKind::Path(properties);
+                    }
+                }
+            }
+
+            EditorAction::CommitPathProperties { id, before, after } => {
+                if before != after {
+                    if let Some(object) = next.document.get_mut(id) {
+                        object.kind = ObjectKind::Path(after.clone());
+                    }
+                    next.history.record(Command::SetPathProperties { id, before, after });
+                }
+            }
+
             EditorAction::ReplaceImageAsset { id, filename, mime_type, natural_width, natural_height, reference } => {
                 if let Some(ObjectKind::Image(before)) = next.document.get(id).map(|o| o.kind.clone()) {
                     let asset_id = next.document.assets.insert(filename, mime_type, natural_width, natural_height, reference);
@@ -583,7 +753,103 @@ impl Reducible for EditorState {
                     next.selected_ids = ids.into_iter().filter(|id| next.document.get(*id).is_some()).collect();
                 }
             }
+
+            EditorAction::NewDocument => {
+                next.document = DesignDocument::default();
+                next.selected_ids = BTreeSet::new();
+                next.active_tool = Tool::Select;
+                next.history = History::default();
+                next.editing_text = None;
+                next.expanded_groups = BTreeSet::new();
+                next.file_path = None;
+                next.document_title = "Untitled".to_string();
+                next.zoom = DEFAULT_ZOOM;
+                next.fit_mode = true;
+                force_dirty = Some(false);
+            }
+
+            EditorAction::LoadDocument { document, path, filename } => {
+                next.document = document;
+                next.selected_ids = BTreeSet::new();
+                next.active_tool = Tool::Select;
+                next.history = History::default();
+                next.editing_text = None;
+                next.expanded_groups = BTreeSet::new();
+                next.file_path = Some(path);
+                next.document_title = filename;
+                next.zoom = DEFAULT_ZOOM;
+                next.fit_mode = true;
+                force_dirty = Some(false);
+            }
+
+            EditorAction::MarkSaved { path, filename } => {
+                next.file_path = Some(path);
+                next.document_title = filename;
+                force_dirty = Some(false);
+            }
+
+            EditorAction::SetZoom(zoom) => {
+                next.zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+                next.fit_mode = false;
+            }
+
+            EditorAction::SetFitMode(enabled) => {
+                next.fit_mode = enabled;
+            }
+
+            EditorAction::SyncFitZoom(zoom) => {
+                next.zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+            }
+
+            EditorAction::SetCanvasSize { width, height, scale_content } => {
+                let before = (next.document.canvas_width, next.document.canvas_height);
+                let after = (width.max(MIN_CANVAS_SIZE), height.max(MIN_CANVAS_SIZE));
+                if before != after {
+                    let mut commands = vec![Command::SetCanvasSize { before, after }];
+                    if scale_content {
+                        let scale_x = after.0 / before.0;
+                        let scale_y = after.1 / before.1;
+                        let mut geometry_changes = Vec::with_capacity(next.document.objects.len());
+                        for object in &next.document.objects {
+                            let g = object.geometry;
+                            let scaled = Geometry {
+                                x: g.x * scale_x,
+                                y: g.y * scale_y,
+                                width: g.width * scale_x,
+                                height: g.height * scale_y,
+                                ..g
+                            };
+                            geometry_changes.push((object.id, g, scaled));
+                        }
+                        for (id, _, after) in &geometry_changes {
+                            if let Some(object) = next.document.get_mut(*id) {
+                                object.geometry = *after;
+                            }
+                        }
+                        commands.extend(geometry_changes.into_iter().map(|(id, before, after)| Command::SetGeometry { id, before, after }));
+                    }
+                    next.document.canvas_width = after.0;
+                    next.document.canvas_height = after.1;
+                    if let Some(command) = batch(commands) {
+                        next.history.record(command);
+                    }
+                }
+            }
+
+            EditorAction::UpdateBackground(color) => {
+                next.document.background = color;
+            }
+
+            EditorAction::CommitBackground { before, after } => {
+                if before != after {
+                    next.document.background = after.clone();
+                    next.history.record(Command::SetBackground { before, after });
+                }
+            }
         }
+
+        next.is_dirty = force_dirty.unwrap_or_else(|| next.is_dirty || next.history.undo_count() != history_before);
+
         Rc::new(next)
     }
 }

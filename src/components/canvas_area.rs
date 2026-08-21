@@ -1,21 +1,29 @@
 use std::collections::BTreeSet;
 
-use web_sys::{DragEvent, Element, FocusEvent, HtmlTextAreaElement, InputEvent, MouseEvent};
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::JsCast;
+use web_sys::{DragEvent, Element, FocusEvent, HtmlTextAreaElement, InputEvent, MouseEvent, WheelEvent};
 use yew::prelude::*;
 
-use crate::editor_state::{use_editor, EditorAction, EditorContext, Tool};
+use crate::editor_state::{use_editor, EditorAction, EditorContext, Tool, MAX_ZOOM, MIN_ZOOM};
+use crate::freehand;
 use crate::image_import::{files_from_drop, import_image_file, ImportTarget};
 use crate::model::{
-    DesignDocument, DesignObject, FontStyle, FontWeight, Geometry, ImageFit, ImageProperties, ObjectId, ObjectKind, TextAlign,
-    TextProperties, TextSizeMode, DUPLICATE_OFFSET, MIN_OBJECT_SIZE,
+    DesignDocument, DesignObject, FontStyle, FontWeight, Geometry, ImageFit, ImageProperties, LineProperties, ObjectId, ObjectKind,
+    PathPoint, PathProperties, ShapeProperties, TextAlign, TextProperties, TextSizeMode, DUPLICATE_OFFSET, MIN_OBJECT_SIZE,
 };
 use crate::snapping::{compute_snap, Guide, GuideOrientation};
 use crate::text_metrics;
 
-const VIEW_WIDTH: f64 = 800.0;
-const VIEW_HEIGHT: f64 = 600.0;
 const MIN_DRAG_SIZE: f64 = 2.0;
 const HANDLE_SIZE: f64 = 6.0;
+/// Breathing room left around the document on every side when Fit mode
+/// computes its zoom, so the artboard never touches the workspace edges.
+const FIT_MARGIN: f64 = 40.0;
+/// How much a freshly computed Fit-mode zoom must differ from the current
+/// `editor.zoom` before it's worth a `SyncFitZoom` dispatch — guards
+/// against re-render/dispatch churn from floating-point noise.
+const FIT_ZOOM_EPSILON: f64 = 0.001;
 
 #[derive(Clone, Copy, PartialEq)]
 struct DragState {
@@ -194,6 +202,55 @@ fn apply_aspect_lock(origin: Geometry, handle: HandleKind, resized: Geometry) ->
     Geometry { x, y, width, height, ..origin }
 }
 
+/// Step (in degrees) the Line tool's endpoint snaps to while Shift is held.
+const LINE_ANGLE_STEP_DEGREES: f64 = 45.0;
+
+/// Snaps `point` to the nearest `LINE_ANGLE_STEP_DEGREES` increment around
+/// `start`, preserving the distance between them — Shift-constrained line
+/// drawing (0°/45°/90°/...).
+fn constrain_line_angle(start: (f64, f64), point: (f64, f64)) -> (f64, f64) {
+    let dx = point.0 - start.0;
+    let dy = point.1 - start.1;
+    let distance = (dx * dx + dy * dy).sqrt();
+    if distance < 1e-6 {
+        return point;
+    }
+    let step = LINE_ANGLE_STEP_DEGREES.to_radians();
+    let angle = (dy.atan2(dx) / step).round() * step;
+    (start.0 + distance * angle.cos(), start.1 + distance * angle.sin())
+}
+
+/// The axis-aligned bounding box of a set of raw canvas-space points, plus
+/// a normalizer that converts any point in that space into a `PathPoint`
+/// fraction of the box — the shared conversion `Line` and `Path` creation
+/// both need to turn a freehand drag into `Geometry` + local-space points.
+/// A degenerate (zero-width or zero-height) box normalizes that axis to
+/// `0.5` rather than dividing by zero.
+fn normalize_points(points: &[(f64, f64)]) -> (Geometry, Vec<PathPoint>) {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for &(x, y) in points {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    let width = max_x - min_x;
+    let height = max_y - min_y;
+    let geometry = Geometry::new(min_x, min_y, width, height);
+    let normalized = points
+        .iter()
+        .map(|&(x, y)| {
+            let fx = if width > 0.0 { (x - min_x) / width } else { 0.5 };
+            let fy = if height > 0.0 { (y - min_y) / height } else { 0.5 };
+            PathPoint::new(fx, fy)
+        })
+        .collect();
+    (geometry, normalized)
+}
+
 /// Expands a selection into the actual set of objects that should move
 /// together: any selected group is replaced by its descendants (a group
 /// has no shape of its own), everything else passes through unchanged.
@@ -237,6 +294,13 @@ enum PointerAction {
     CreateDraft(DragState),
     /// Rubber-band selection drag on empty canvas.
     Marquee(DragState),
+    /// An in-progress Pencil stroke: every recorded point so far, in raw
+    /// canvas coordinates (converted to a normalized `Path` only once, on
+    /// pointer-up — see `normalize_points`). Points are appended in
+    /// `on_pointer_move`, but only when the pointer has moved at least
+    /// `freehand::MIN_POINT_DISTANCE`, so a slow drag doesn't flood this
+    /// with near-duplicates.
+    DrawPath(Vec<(f64, f64)>),
     MoveSelection {
         origins: Vec<(ObjectId, Geometry)>,
         start_x: f64,
@@ -249,19 +313,32 @@ enum PointerAction {
     ResizeObject { id: ObjectId, origin: Geometry, handle: HandleKind },
 }
 
+/// The largest zoom at which a `canvas_width` × `canvas_height` document
+/// fits entirely inside a `workspace_width` × `workspace_height` area, with
+/// `FIT_MARGIN` of breathing room on every side. Pure so it's easy to
+/// reason about/test independently of the DOM measurement that feeds it.
+fn compute_fit_zoom(workspace_width: f64, workspace_height: f64, canvas_width: f64, canvas_height: f64) -> f64 {
+    let available_width = (workspace_width - FIT_MARGIN * 2.0).max(1.0);
+    let available_height = (workspace_height - FIT_MARGIN * 2.0).max(1.0);
+    (available_width / canvas_width).min(available_height / canvas_height).clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
 /// Maps a mouse event's viewport coordinates onto the SVG's own coordinate
 /// space, regardless of which nested element the event actually targeted.
-fn canvas_point(svg_ref: &NodeRef, event: &MouseEvent) -> Option<(f64, f64)> {
+/// `view_width`/`view_height` are the document's actual canvas dimensions —
+/// the SVG's `viewBox` always matches them exactly (see `canvas_area`), so
+/// this conversion stays correct at any canvas size.
+fn canvas_point(svg_ref: &NodeRef, event: &MouseEvent, view_width: f64, view_height: f64) -> Option<(f64, f64)> {
     let el = svg_ref.cast::<Element>()?;
     let rect = el.get_bounding_client_rect();
     if rect.width() == 0.0 || rect.height() == 0.0 {
         return None;
     }
-    let scale_x = VIEW_WIDTH / rect.width();
-    let scale_y = VIEW_HEIGHT / rect.height();
+    let scale_x = view_width / rect.width();
+    let scale_y = view_height / rect.height();
     let x = (event.client_x() as f64 - rect.left()) * scale_x;
     let y = (event.client_y() as f64 - rect.top()) * scale_y;
-    Some((x.clamp(0.0, VIEW_WIDTH), y.clamp(0.0, VIEW_HEIGHT)))
+    Some((x.clamp(0.0, view_width), y.clamp(0.0, view_height)))
 }
 
 /// An image object's rendered content: a real, still-vector `<image>`
@@ -327,7 +404,7 @@ fn render_text_content(props: &TextProperties, g: &Geometry) -> Html {
         props.font_style.css_value(),
         props.letter_spacing,
         props.text_decoration.css_value(),
-        props.fill,
+        props.fill.to_css(),
     );
 
     html! {
@@ -342,6 +419,70 @@ fn render_text_content(props: &TextProperties, g: &Geometry) -> Html {
             </text>
         </>
     }
+}
+
+/// How much wider than its visible stroke a line/path's invisible
+/// click-target gets — a 1-2px stroke is otherwise nearly impossible to
+/// click precisely, especially once zoomed out. Purely a hit-testing aid
+/// (`pointer-events="stroke"` + `stroke="transparent"`); it paints nothing.
+const HIT_AREA_PADDING: f64 = 10.0;
+
+/// A line's rendered content: a real SVG `<line>` between its two
+/// endpoints, converted from their local-space fractions (see
+/// `model.rs`'s `PathPoint` docs) into the object's own `0..width,
+/// 0..height` coordinate space — the same space `render_object`'s
+/// translate+rotate wrapper already positions every other kind in. Paired
+/// with an invisible, wider sibling so the line stays selectable without
+/// needing pixel-precise clicks (see `HIT_AREA_PADDING`) — it's a sibling
+/// rather than a wider visible stroke so it never changes what's drawn.
+fn render_line_content(props: &LineProperties, g: &Geometry) -> Html {
+    let x1 = (props.start.x * g.width).to_string();
+    let y1 = (props.start.y * g.height).to_string();
+    let x2 = (props.end.x * g.width).to_string();
+    let y2 = (props.end.y * g.height).to_string();
+    let style = format!("stroke:{};stroke-width:{};stroke-linecap:round;", props.stroke_color.to_css(), props.stroke_width);
+    let hit_width = props.stroke_width + HIT_AREA_PADDING;
+    html! {
+        <>
+            <line x1={x1.clone()} y1={y1.clone()} x2={x2.clone()} y2={y2.clone()} stroke="transparent" stroke-width={hit_width.to_string()} pointer-events="stroke" />
+            <line {x1} {y1} {x2} {y2} {style} />
+        </>
+    }
+}
+
+/// A freehand path's rendered content: the stored local-space points
+/// (already simplified at creation time — see `freehand.rs`) scaled into
+/// the object's box, then smoothed into a single `<path>` `d` string.
+/// Never filled. Paired with an invisible, wider hit-target sibling — see
+/// `render_line_content`'s docs on `HIT_AREA_PADDING`.
+fn render_path_content(props: &PathProperties, g: &Geometry) -> Html {
+    let local_points: Vec<(f64, f64)> = props.points.iter().map(|p| (p.x * g.width, p.y * g.height)).collect();
+    let d = freehand::smooth_path_d(&local_points);
+    let hit_width = props.stroke_width + HIT_AREA_PADDING;
+    let style = format!(
+        "fill:none;stroke:{};stroke-width:{};stroke-linecap:round;stroke-linejoin:round;",
+        props.stroke_color.to_css(),
+        props.stroke_width
+    );
+    html! {
+        <>
+            <path d={d.clone()} fill="none" stroke="transparent" stroke-width={hit_width.to_string()} pointer-events="stroke" />
+            <path {d} {style} />
+        </>
+    }
+}
+
+/// Inline `fill`/`stroke` for a rectangle/ellipse, built from its
+/// `ShapeProperties` — overrides the CSS class's placeholder fill/stroke
+/// (see `.canvas-object__rect`/`.canvas-object__ellipse` in styles.css) now
+/// that shapes carry real per-object color data.
+fn shape_style(props: &ShapeProperties) -> String {
+    let stroke = if props.stroke.enabled {
+        format!("stroke:{};stroke-width:{};", props.stroke.color.to_css(), props.stroke.width)
+    } else {
+        "stroke:none;".to_string()
+    };
+    format!("fill:{};{stroke}", props.fill.to_css())
 }
 
 /// Renders one object's shape, positioned via a translate+rotate transform
@@ -379,18 +520,21 @@ fn render_object(
     };
 
     let inner = match &object.kind {
-        ObjectKind::Rectangle => html! {
-            <rect x="0" y="0" width={g.width.to_string()} height={g.height.to_string()} class="canvas-object__rect" />
+        ObjectKind::Rectangle(props) => html! {
+            <rect x="0" y="0" width={g.width.to_string()} height={g.height.to_string()} class="canvas-object__rect" style={shape_style(props)} />
         },
-        ObjectKind::Ellipse => html! {
+        ObjectKind::Ellipse(props) => html! {
             <ellipse
                 cx={(g.width / 2.0).to_string()}
                 cy={(g.height / 2.0).to_string()}
                 rx={(g.width / 2.0).to_string()}
                 ry={(g.height / 2.0).to_string()}
                 class="canvas-object__ellipse"
+                style={shape_style(props)}
             />
         },
+        ObjectKind::Line(props) => render_line_content(props, g),
+        ObjectKind::Path(props) => render_path_content(props, g),
         ObjectKind::Text(props) => render_text_content(props, g),
         ObjectKind::Image(props) => render_image_content(props, g, object.id, document),
         ObjectKind::Group => html! {},
@@ -472,8 +616,24 @@ fn render_draft(drag: &DragState, tool: Tool) -> Html {
                 class="canvas-draft"
             />
         },
+        Tool::Line => html! {
+            <line
+                x1={drag.start_x.to_string()} y1={drag.start_y.to_string()}
+                x2={drag.current_x.to_string()} y2={drag.current_y.to_string()}
+                class="canvas-draft"
+            />
+        },
         _ => html! {},
     }
+}
+
+/// Live preview of an in-progress Pencil stroke — the same smoothing the
+/// finished `Path` renders with, applied directly to the raw (not yet
+/// simplified) recorded points, so the preview never jumps when
+/// simplification runs on pointer-up.
+fn render_path_draft(points: &[(f64, f64)]) -> Html {
+    let d = freehand::smooth_path_d(points);
+    html! { <path {d} class="canvas-draft" style="fill:none;" /> }
 }
 
 /// Temporary alignment guide lines shown only while an object is actively
@@ -549,7 +709,7 @@ fn render_text_editor(
         props.font_style.css_value(),
         props.line_height,
         props.letter_spacing * scale_x,
-        props.fill,
+        props.fill.to_css(),
         text_metrics::VERTICAL_PADDING * scale_y,
         text_metrics::HORIZONTAL_PADDING * scale_x,
     );
@@ -640,6 +800,7 @@ fn render_text_editor(
 pub fn canvas_area() -> Html {
     let editor = use_editor();
     let svg_ref = use_node_ref();
+    let canvas_area_ref = use_node_ref();
     let pointer_action = use_state(|| None::<PointerAction>);
     let guides = use_state(Vec::<Guide>::new);
     let text_area_ref = use_node_ref();
@@ -650,6 +811,41 @@ pub fn canvas_area() -> Html {
     // Whether a file is currently being dragged over the canvas — purely a
     // transient visual cue, never touches the document.
     let is_drag_over = use_state(|| false);
+    // Bumped on every window "resize" event (and once on mount) purely to
+    // force a re-render — a resize alone changes no Yew state, but Fit mode
+    // needs to re-measure `canvas_area_ref` and recompute its zoom when the
+    // workspace actually changes size.
+    let resize_tick = use_state(|| 0u32);
+
+    // Registers a window resize listener for the component's lifetime. The
+    // listener `Closure` is moved into the returned cleanup closure so it
+    // stays alive for as long as it's registered — dropping it earlier
+    // would invalidate the JS callback while the browser can still call it.
+    {
+        let resize_tick = resize_tick.clone();
+        use_effect_with((), move |()| {
+            // Forces one extra render right after mount, once
+            // `canvas_area_ref` is actually attached to the DOM, so Fit
+            // mode's first measurement reflects real layout instead of the
+            // default zoom.
+            resize_tick.set(1);
+
+            let tick_for_listener = resize_tick.clone();
+            let closure = Closure::<dyn Fn()>::new(move || {
+                tick_for_listener.set((*tick_for_listener).wrapping_add(1));
+            });
+            let window = web_sys::window();
+            if let Some(win) = window.as_ref() {
+                let _ = win.add_event_listener_with_callback("resize", closure.as_ref().unchecked_ref());
+            }
+            move || {
+                if let Some(win) = window {
+                    let _ = win.remove_event_listener_with_callback("resize", closure.as_ref().unchecked_ref());
+                }
+                drop(closure);
+            }
+        });
+    }
 
     {
         let editing_snapshot = editing_snapshot.clone();
@@ -673,6 +869,36 @@ pub fn canvas_area() -> Html {
         });
     }
 
+    // Fit mode: while it's on, keep `editor.zoom` in sync with the largest
+    // zoom that fits the whole document inside the actual measured
+    // workspace (`canvas_area_ref`'s own box, which — thanks to the grid
+    // layout in `styles.css` — already excludes the toolbar/left panel/
+    // right panel/status bar). Re-runs when fit mode toggles on, the
+    // canvas is resized, or the window is (`resize_tick`); the dispatch
+    // only fires when the computed value actually moved, so this settles
+    // after one extra render instead of looping.
+    {
+        let editor = editor.clone();
+        let canvas_area_ref = canvas_area_ref.clone();
+        let fit_mode = editor.fit_mode;
+        let canvas_width = editor.document.canvas_width;
+        let canvas_height = editor.document.canvas_height;
+        let current_zoom = editor.zoom;
+        use_effect_with((fit_mode, canvas_width, canvas_height, *resize_tick), move |_| {
+            if fit_mode {
+                if let Some(rect) = canvas_area_ref.cast::<Element>().map(|el| el.get_bounding_client_rect()) {
+                    if rect.width() > 0.0 && rect.height() > 0.0 {
+                        let target = compute_fit_zoom(rect.width(), rect.height(), canvas_width, canvas_height);
+                        if (target - current_zoom).abs() > FIT_ZOOM_EPSILON {
+                            editor.dispatch(EditorAction::SyncFitZoom(target));
+                        }
+                    }
+                }
+            }
+            || ()
+        });
+    }
+
     let on_pointer_down = {
         let editor = editor.clone();
         let svg_ref = svg_ref.clone();
@@ -680,17 +906,20 @@ pub fn canvas_area() -> Html {
         let guides = guides.clone();
         Callback::from(move |event: MouseEvent| {
             guides.set(Vec::new());
-            let Some((x, y)) = canvas_point(&svg_ref, &event) else {
+            let Some((x, y)) = canvas_point(&svg_ref, &event, editor.document.canvas_width, editor.document.canvas_height) else {
                 return;
             };
             match editor.active_tool {
-                Tool::Rectangle | Tool::Ellipse => {
+                Tool::Rectangle | Tool::Ellipse | Tool::Line => {
                     pointer_action.set(Some(PointerAction::CreateDraft(DragState {
                         start_x: x,
                         start_y: y,
                         current_x: x,
                         current_y: y,
                     })));
+                }
+                Tool::Pen => {
+                    pointer_action.set(Some(PointerAction::DrawPath(vec![(x, y)])));
                 }
                 Tool::Text => {
                     // The click point becomes the new box's exact
@@ -716,7 +945,7 @@ pub fn canvas_area() -> Html {
                         current_y: y,
                     })));
                 }
-                Tool::Line | Tool::Pen | Tool::Hand => {}
+                Tool::Hand => {}
             }
         })
     };
@@ -730,16 +959,28 @@ pub fn canvas_area() -> Html {
             let Some(action) = (*pointer_action).clone() else {
                 return;
             };
-            let Some((x, y)) = canvas_point(&svg_ref, &event) else {
+            let Some((x, y)) = canvas_point(&svg_ref, &event, editor.document.canvas_width, editor.document.canvas_height) else {
                 return;
             };
             match action {
                 PointerAction::CreateDraft(state) => {
+                    let (current_x, current_y) = if editor.active_tool == Tool::Line && event.shift_key() {
+                        constrain_line_angle((state.start_x, state.start_y), (x, y))
+                    } else {
+                        (x, y)
+                    };
                     pointer_action.set(Some(PointerAction::CreateDraft(DragState {
-                        current_x: x,
-                        current_y: y,
+                        current_x,
+                        current_y,
                         ..state
                     })));
+                }
+                PointerAction::DrawPath(mut points) => {
+                    let moved_enough = points.last().is_none_or(|&(lx, ly)| ((x - lx).powi(2) + (y - ly).powi(2)).sqrt() >= freehand::MIN_POINT_DISTANCE);
+                    if moved_enough {
+                        points.push((x, y));
+                        pointer_action.set(Some(PointerAction::DrawPath(points)));
+                    }
                 }
                 PointerAction::Marquee(state) => {
                     pointer_action.set(Some(PointerAction::Marquee(DragState {
@@ -757,7 +998,7 @@ pub fn canvas_area() -> Html {
                         .collect();
                     let exclude: BTreeSet<ObjectId> = origins.iter().map(|(id, _)| *id).collect();
                     let (snap_dx, snap_dy, new_guides) =
-                        compute_snap(&editor.document, &exclude, bbox_of(&candidates), VIEW_WIDTH, VIEW_HEIGHT);
+                        compute_snap(&editor.document, &exclude, bbox_of(&candidates), editor.document.canvas_width, editor.document.canvas_height);
                     guides.set(new_guides);
                     for (id, origin) in &origins {
                         let geometry = Geometry { x: origin.x + dx + snap_dx, y: origin.y + dy + snap_dy, ..*origin };
@@ -784,14 +1025,32 @@ pub fn canvas_area() -> Html {
             guides.set(Vec::new());
             if let Some(action) = (*pointer_action).clone() {
                 match action {
+                    PointerAction::CreateDraft(state) if editor.active_tool == Tool::Line => {
+                        let start = (state.start_x, state.start_y);
+                        let end = (state.current_x, state.current_y);
+                        let length = ((end.0 - start.0).powi(2) + (end.1 - start.1).powi(2)).sqrt();
+                        if length >= MIN_DRAG_SIZE {
+                            let (geometry, normalized) = normalize_points(&[start, end]);
+                            let properties = LineProperties { start: normalized[0], end: normalized[1], ..LineProperties::default() };
+                            editor.dispatch(EditorAction::CreateObject { kind: ObjectKind::Line(properties), geometry });
+                        }
+                    }
                     PointerAction::CreateDraft(state) => {
                         let geometry = state.geometry();
                         if geometry.width >= MIN_DRAG_SIZE && geometry.height >= MIN_DRAG_SIZE {
                             let kind = match editor.active_tool {
-                                Tool::Ellipse => ObjectKind::Ellipse,
-                                _ => ObjectKind::Rectangle,
+                                Tool::Ellipse => ObjectKind::Ellipse(ShapeProperties::default()),
+                                _ => ObjectKind::Rectangle(ShapeProperties::default()),
                             };
                             editor.dispatch(EditorAction::CreateObject { kind, geometry });
+                        }
+                    }
+                    PointerAction::DrawPath(points) => {
+                        let simplified = freehand::simplify(&points, freehand::SIMPLIFY_EPSILON);
+                        if simplified.len() >= 2 {
+                            let (geometry, normalized) = normalize_points(&simplified);
+                            let properties = PathProperties { points: normalized, ..PathProperties::default() };
+                            editor.dispatch(EditorAction::CreateObject { kind: ObjectKind::Path(properties), geometry });
                         }
                     }
                     PointerAction::Marquee(state) => {
@@ -822,7 +1081,7 @@ pub fn canvas_area() -> Html {
                         }
                     }
                     PointerAction::MoveSelection { origins, start_x, start_y, clicked_id } => {
-                        if let Some((x, y)) = canvas_point(&svg_ref, &event) {
+                        if let Some((x, y)) = canvas_point(&svg_ref, &event, editor.document.canvas_width, editor.document.canvas_height) {
                             let dx = x - start_x;
                             let dy = y - start_y;
                             let moved = dx.abs() >= MIN_DRAG_SIZE || dy.abs() >= MIN_DRAG_SIZE;
@@ -909,15 +1168,15 @@ pub fn canvas_area() -> Html {
         html! {}
     };
 
-    // Converts the SVG's own 800x600 coordinate space to whatever CSS
-    // pixel size it's actually rendered at, so the text-edit textarea
+    // Converts the SVG's own document-canvas coordinate space to whatever
+    // CSS pixel size it's actually rendered at, so the text-edit textarea
     // (a plain HTML element outside the SVG) lines up with it exactly.
     let (overlay_scale_x, overlay_scale_y) = svg_ref
         .cast::<Element>()
         .map(|el| {
             let rect = el.get_bounding_client_rect();
             if rect.width() > 0.0 && rect.height() > 0.0 {
-                (rect.width() / VIEW_WIDTH, rect.height() / VIEW_HEIGHT)
+                (rect.width() / editor.document.canvas_width, rect.height() / editor.document.canvas_height)
             } else {
                 (1.0, 1.0)
             }
@@ -967,7 +1226,8 @@ pub fn canvas_area() -> Html {
             is_drag_over.set(false);
             // `DragEvent` extends `MouseEvent` in the DOM, so it carries
             // the same client coordinates `canvas_point` reads.
-            let center = canvas_point(&svg_ref, &event).unwrap_or((VIEW_WIDTH / 2.0, VIEW_HEIGHT / 2.0));
+            let (canvas_width, canvas_height) = (editor.document.canvas_width, editor.document.canvas_height);
+            let center = canvas_point(&svg_ref, &event, canvas_width, canvas_height).unwrap_or((canvas_width / 2.0, canvas_height / 2.0));
             for (index, file) in files_from_drop(&event).into_iter().enumerate() {
                 let offset = index as f64 * DUPLICATE_OFFSET;
                 import_image_file(
@@ -979,13 +1239,65 @@ pub fn canvas_area() -> Html {
         })
     };
 
+    // Ctrl/Cmd+wheel zooms, centered on the cursor; a plain wheel is left
+    // alone entirely (no `prevent_default`) so normal scrolling/panning
+    // keeps working exactly as before.
+    let on_wheel = {
+        let editor = editor.clone();
+        let canvas_area_ref = canvas_area_ref.clone();
+        Callback::from(move |event: WheelEvent| {
+            if !(event.ctrl_key() || event.meta_key()) {
+                return;
+            }
+            event.prevent_default();
+            let old_zoom = editor.zoom;
+            let factor = if event.delta_y() < 0.0 { 1.1 } else { 1.0 / 1.1 };
+            let new_zoom = (old_zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+            if let Some(container) = canvas_area_ref.cast::<Element>() {
+                let rect = container.get_bounding_client_rect();
+                let cursor_x = event.client_x() as f64 - rect.left();
+                let cursor_y = event.client_y() as f64 - rect.top();
+                let ratio = new_zoom / old_zoom - 1.0;
+                let new_scroll_left = container.scroll_left() as f64 + cursor_x * ratio;
+                let new_scroll_top = container.scroll_top() as f64 + cursor_y * ratio;
+                editor.dispatch(EditorAction::SetZoom(new_zoom));
+                container.set_scroll_left(new_scroll_left as i32);
+                container.set_scroll_top(new_scroll_top as i32);
+            } else {
+                editor.dispatch(EditorAction::SetZoom(new_zoom));
+            }
+        })
+    };
+
+    let artboard_class =
+        classes!("canvas-area__artboard", is_drag_over.then_some("canvas-area__artboard--drag-over"));
+    let canvas_width = editor.document.canvas_width;
+    let canvas_height = editor.document.canvas_height;
+    // The document's coordinate system never changes with zoom — the SVG
+    // keeps its `viewBox` fixed at the actual document size. Only the
+    // rendered CSS box (both the artboard chrome and the SVG itself) is
+    // sized to `document size × zoom`: screenPosition = documentPosition ×
+    // zoom. Sizing the box itself (rather than a `transform: scale()` on
+    // top of a full-size box) is what keeps `.canvas-area`'s `overflow:
+    // auto` scrollable region tied to the *visible* size — a full-size box
+    // regardless of zoom is exactly what forced scrollbars at large canvas
+    // sizes.
+    let display_width = canvas_width * editor.zoom;
+    let display_height = canvas_height * editor.zoom;
+    // The background color is a document property (`DesignDocument::
+    // background`) rather than the static `--bg-artboard` the CSS class
+    // otherwise falls back to, so it's set here as an inline override.
+    let artboard_style = format!("width: {display_width}px; height: {display_height}px; background-color: {};", editor.document.background);
+    let svg_style = format!("width: {display_width}px; height: {display_height}px;");
+
     html! {
-        <section class="canvas-area" tabindex="0" ondragover={on_drag_over} ondragleave={on_drag_leave} ondrop={on_drop}>
-            <div class={if *is_drag_over { "canvas-area__artboard canvas-area__artboard--drag-over" } else { "canvas-area__artboard" }}>
+        <section class="canvas-area" tabindex="0" ref={canvas_area_ref.clone()} ondragover={on_drag_over} ondragleave={on_drag_leave} ondrop={on_drop} onwheel={on_wheel}>
+            <div class={artboard_class} style={artboard_style}>
                 <svg
                     ref={svg_ref.clone()}
                     class="canvas-area__svg"
-                    viewBox="0 0 800 600"
+                    style={svg_style}
+                    viewBox={format!("0 0 {canvas_width} {canvas_height}")}
                     xmlns="http://www.w3.org/2000/svg"
                     onmousedown={on_pointer_down}
                     onmousemove={on_pointer_move}
@@ -1031,7 +1343,7 @@ pub fn canvas_area() -> Html {
                                 editor.dispatch(EditorAction::SetSelection(selection.clone()));
                             }
                             let targets = move_targets(&editor.document, &selection);
-                            let Some((x, y)) = canvas_point(&svg_ref, &event) else {
+                            let Some((x, y)) = canvas_point(&svg_ref, &event, editor.document.canvas_width, editor.document.canvas_height) else {
                                 return;
                             };
                             let origins: Vec<(ObjectId, Geometry)> =
@@ -1050,6 +1362,7 @@ pub fn canvas_area() -> Html {
                     { match &*pointer_action {
                         Some(PointerAction::CreateDraft(state)) => render_draft(state, editor.active_tool),
                         Some(PointerAction::Marquee(state)) => render_marquee(state),
+                        Some(PointerAction::DrawPath(points)) => render_path_draft(points),
                         _ => html! {},
                     } }
                     { selection_view }

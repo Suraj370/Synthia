@@ -13,15 +13,20 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::asset_manager::{AssetId, AssetManager};
+// Re-exported so callers can `use crate::model::Color` alongside every
+// other document type, without needing to know fill/stroke colors happen
+// to be defined in their own module.
+pub use crate::color::Color;
 
 pub type ObjectId = u64;
 
-/// Bumped whenever the document's shape changes in a way a future
-/// load/save path would need to migrate around. Nothing reads or writes a
-/// document to disk yet, so this has no behavior today — it exists so
-/// that whenever persistence lands, "what format is this" is already a
-/// question the model can answer.
+/// Bumped whenever the document's shape changes in a way the save/open
+/// path (`document_io.rs`) would need to migrate around. Only version 1
+/// exists today, so there's nothing to migrate yet, but every saved file
+/// carries this so a future format change has something to check against.
 pub const DOCUMENT_FORMAT_VERSION: u32 = 1;
 
 /// The smallest width/height an object may have. Enforced everywhere a
@@ -29,12 +34,17 @@ pub const DOCUMENT_FORMAT_VERSION: u32 = 1;
 /// invariant lives in one place.
 pub const MIN_OBJECT_SIZE: f64 = 8.0;
 
+/// The smallest width/height the document canvas itself may have. Enforced
+/// wherever the canvas size is written (Canvas Size panel), mirroring how
+/// `MIN_OBJECT_SIZE` guards individual objects.
+pub const MIN_CANVAS_SIZE: f64 = 1.0;
+
 /// How far a duplicated or pasted object is offset from its source, so the
 /// copy is visibly distinct instead of sitting exactly on top of the
 /// original.
 pub const DUPLICATE_OFFSET: f64 = 16.0;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Geometry {
     pub x: f64,
     pub y: f64,
@@ -57,10 +67,97 @@ impl Geometry {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// A shape's stroke: kept as a flag plus color/width (rather than
+/// `Option<Stroke>`) so toggling "no stroke" off and back on doesn't lose
+/// whatever color/width the user had dialed in.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Stroke {
+    pub color: Color,
+    pub width: f64,
+    pub enabled: bool,
+}
+
+impl Default for Stroke {
+    fn default() -> Self {
+        Self { color: Color::rgb(0x47, 0x47, 0x4c), width: 1.0, enabled: true }
+    }
+}
+
+/// Everything about a rectangle/ellipse's appearance that isn't its
+/// transform — mirrors `TextProperties`/`ImageProperties`: `Geometry` still
+/// owns position/size/rotation/opacity, this only owns fill/stroke.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShapeProperties {
+    pub fill: Color,
+    pub stroke: Stroke,
+}
+
+impl Default for ShapeProperties {
+    fn default() -> Self {
+        Self { fill: Color::rgb(0x2b, 0x2b, 0x2f), stroke: Stroke::default() }
+    }
+}
+
+/// A point in an object's own local space, normalized to its bounding box:
+/// `(0, 0)` is the box's top-left corner, `(1, 1)` its bottom-right —
+/// exactly the `Geometry`-local coordinate space every other kind's shape
+/// already renders in (see `canvas_area.rs`'s `render_object`). Storing
+/// `Line`/`Path` endpoints this way, rather than absolute canvas
+/// coordinates, is what lets them reuse the existing move/resize/rotate
+/// machinery unchanged: resizing the bounding box rescales the points with
+/// it, and rotation is just the shared `Geometry.rotation` applied to the
+/// whole box.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PathPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl PathPoint {
+    pub const fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
+    }
+}
+
+/// A straight line between two points in the object's local space. Always
+/// visible (no fill, no stroke on/off toggle — a line with no stroke has
+/// nothing to show), so its own color/width live directly on this struct
+/// rather than reusing `Stroke`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LineProperties {
+    pub start: PathPoint,
+    pub end: PathPoint,
+    pub stroke_color: Color,
+    pub stroke_width: f64,
+}
+
+impl Default for LineProperties {
+    fn default() -> Self {
+        Self { start: PathPoint::new(0.0, 0.0), end: PathPoint::new(1.0, 1.0), stroke_color: Color::rgb(0xec, 0xec, 0xee), stroke_width: 2.0 }
+    }
+}
+
+/// A freehand stroke: the (already simplified — see `freehand.rs`) points
+/// making up the drawn path, in the object's local space. Never filled.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PathProperties {
+    pub points: Vec<PathPoint>,
+    pub stroke_color: Color,
+    pub stroke_width: f64,
+}
+
+impl Default for PathProperties {
+    fn default() -> Self {
+        Self { points: Vec::new(), stroke_color: Color::rgb(0xec, 0xec, 0xee), stroke_width: 2.0 }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ObjectKind {
-    Rectangle,
-    Ellipse,
+    Rectangle(ShapeProperties),
+    Ellipse(ShapeProperties),
+    Line(LineProperties),
+    Path(PathProperties),
     Text(TextProperties),
     Image(ImageProperties),
     /// A pure container: has no shape of its own. Its children (objects
@@ -73,8 +170,10 @@ pub enum ObjectKind {
 impl ObjectKind {
     pub fn type_label(&self) -> &'static str {
         match self {
-            ObjectKind::Rectangle => "Rectangle",
-            ObjectKind::Ellipse => "Ellipse",
+            ObjectKind::Rectangle(_) => "Rectangle",
+            ObjectKind::Ellipse(_) => "Ellipse",
+            ObjectKind::Line(_) => "Line",
+            ObjectKind::Path(_) => "Path",
             ObjectKind::Text(_) => "Text",
             ObjectKind::Image(_) => "Image",
             ObjectKind::Group => "Group",
@@ -92,7 +191,7 @@ impl ObjectKind {
 /// system. Each variant's `css_stack` lists its own graceful fallbacks, so
 /// if the named face isn't installed the browser silently substitutes a
 /// close system font instead of failing to render.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FontFamily {
     #[default]
     Inter,
@@ -150,7 +249,7 @@ impl FontFamily {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FontWeight {
     #[default]
     Regular,
@@ -185,7 +284,7 @@ impl FontWeight {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FontStyle {
     #[default]
     Regular,
@@ -201,7 +300,7 @@ impl FontStyle {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TextAlign {
     #[default]
     Left,
@@ -209,7 +308,7 @@ pub enum TextAlign {
     Right,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TextDecoration {
     #[default]
     None,
@@ -232,7 +331,7 @@ impl TextDecoration {
 /// resize handle on an `Auto` text object is what switches it to `Fixed` —
 /// there's no separate mode toggle, matching how resizing already implies
 /// "I want to control this box's size" for every other object kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TextSizeMode {
     #[default]
     Auto,
@@ -243,7 +342,7 @@ pub enum TextSizeMode {
 /// size, rotation, opacity — all still plain `Geometry`, shared with every
 /// other object kind). Kept as one explicit, typed struct rather than a
 /// generic property bag so every text field is checked at compile time.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextProperties {
     pub content: String,
     pub font_family: FontFamily,
@@ -255,8 +354,9 @@ pub struct TextProperties {
     pub line_height: f64,
     /// Extra space between characters, in the same units as `font_size`.
     pub letter_spacing: f64,
-    /// CSS color for the glyphs.
-    pub fill: String,
+    /// Color for the glyphs — the same typed `Color` every fill/stroke in
+    /// Apollo uses.
+    pub fill: Color,
     pub text_decoration: TextDecoration,
     pub size_mode: TextSizeMode,
 }
@@ -272,7 +372,7 @@ impl Default for TextProperties {
             text_align: TextAlign::default(),
             line_height: 1.2,
             letter_spacing: 0.0,
-            fill: "#ececee".to_string(),
+            fill: Color::rgb(0xec, 0xec, 0xee),
             text_decoration: TextDecoration::default(),
             size_mode: TextSizeMode::default(),
         }
@@ -281,7 +381,7 @@ impl Default for TextProperties {
 
 /// How an image's pixels map onto its (possibly different-aspect-ratio)
 /// on-canvas box.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ImageFit {
     /// Stretches to exactly fill the box, ignoring aspect ratio.
     #[default]
@@ -299,13 +399,13 @@ pub enum ImageFit {
 /// rotation/opacity, this only owns what's specific to being an image.
 /// Deliberately just a reference (`asset_id`) rather than pixel data —
 /// see `asset_manager.rs`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageProperties {
     pub asset_id: AssetId,
     pub fit: ImageFit,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DesignObject {
     pub id: ObjectId,
     pub name: String,
@@ -316,13 +416,27 @@ pub struct DesignObject {
     pub parent_id: Option<ObjectId>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// Default artboard size for a new document. Not yet user-editable (no UI
+/// exposes changing it), but a real field on the document — rather than a
+/// hardcoded render-time constant — since the saved file format needs to
+/// round-trip it, and a future resizable-canvas feature has a home to
+/// land in.
+pub const DEFAULT_CANVAS_WIDTH: f64 = 800.0;
+pub const DEFAULT_CANVAS_HEIGHT: f64 = 600.0;
+const DEFAULT_BACKGROUND: &str = "#19191c";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DesignDocument {
     pub objects: Vec<DesignObject>,
     /// Local image data referenced by any `ObjectKind::Image` in
     /// `objects` via its `asset_id` — see `asset_manager.rs`.
     pub assets: AssetManager,
     pub version: u32,
+    pub canvas_width: f64,
+    pub canvas_height: f64,
+    /// CSS color for the artboard background — plain data on the document
+    /// (not a hardcoded style) so it saves/restores with everything else.
+    pub background: String,
     next_id: ObjectId,
 }
 
@@ -332,6 +446,9 @@ impl Default for DesignDocument {
             objects: Vec::new(),
             assets: AssetManager::default(),
             version: DOCUMENT_FORMAT_VERSION,
+            canvas_width: DEFAULT_CANVAS_WIDTH,
+            canvas_height: DEFAULT_CANVAS_HEIGHT,
+            background: DEFAULT_BACKGROUND.to_string(),
             next_id: 0,
         }
     }

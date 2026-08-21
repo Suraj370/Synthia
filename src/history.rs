@@ -3,7 +3,7 @@
 //! after `Geometry`, an index) — never rendered output, so this stays cheap
 //! regardless of how complex the document gets.
 
-use crate::model::{DesignDocument, DesignObject, Geometry, ImageProperties, ObjectId, ObjectKind, TextProperties};
+use crate::model::{DesignDocument, DesignObject, Geometry, ImageProperties, LineProperties, ObjectId, ObjectKind, PathProperties, ShapeProperties, TextProperties};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
@@ -25,11 +25,31 @@ pub enum Command {
     /// An image object's fit mode or asset reference changed (a Properties
     /// panel edit, or "Replace image" — both just swap `ImageProperties`).
     SetImageProperties { id: ObjectId, before: ImageProperties, after: ImageProperties },
+    /// A rectangle/ellipse's fill/stroke changed (a Properties panel field,
+    /// or one drag gesture on the color picker collapsed into a single
+    /// step).
+    SetShapeProperties { id: ObjectId, before: ShapeProperties, after: ShapeProperties },
+    /// A line's endpoints or stroke color/width changed (endpoint drags are
+    /// `SetGeometry` since the box IS the endpoints — see `model.rs`'s
+    /// `PathPoint` docs; this only covers Properties panel / color-picker
+    /// edits to the stroke).
+    SetLineProperties { id: ObjectId, before: LineProperties, after: LineProperties },
+    /// A freehand path's stroke color/width changed. The recorded points
+    /// themselves never change after creation — only a new drawing can
+    /// produce different points.
+    SetPathProperties { id: ObjectId, before: PathProperties, after: PathProperties },
     /// One or more objects were reparented (grouping/ungrouping).
     SetParent { changes: Vec<(ObjectId, Option<ObjectId>, Option<ObjectId>)> },
     /// An object moved to a different position in document (z-)order, e.g.
     /// via drag-reordering in the Layers panel.
     Reorder { id: ObjectId, before_index: usize, after_index: usize },
+    /// The document canvas width/height changed (Canvas Size panel, or a
+    /// preset). When "Scale content" was on, the object geometry changes
+    /// that came along with it are separate `SetGeometry` commands batched
+    /// alongside this one, not folded into it.
+    SetCanvasSize { before: (f64, f64), after: (f64, f64) },
+    /// The document background color changed (Canvas Size panel).
+    SetBackground { before: String, after: String },
     /// Several commands that only make sense as one undo/redo step.
     Batch(Vec<Command>),
 }
@@ -58,6 +78,24 @@ impl Command {
                     object.kind = ObjectKind::Image(*after);
                 }
             }
+            Command::SetShapeProperties { id, after, .. } => {
+                if let Some(object) = document.get_mut(*id) {
+                    match &mut object.kind {
+                        ObjectKind::Rectangle(props) | ObjectKind::Ellipse(props) => *props = *after,
+                        _ => {}
+                    }
+                }
+            }
+            Command::SetLineProperties { id, after, .. } => {
+                if let Some(object) = document.get_mut(*id) {
+                    object.kind = ObjectKind::Line(*after);
+                }
+            }
+            Command::SetPathProperties { id, after, .. } => {
+                if let Some(object) = document.get_mut(*id) {
+                    object.kind = ObjectKind::Path(after.clone());
+                }
+            }
             Command::SetParent { changes } => {
                 for (id, _, after) in changes {
                     if let Some(object) = document.get_mut(*id) {
@@ -67,6 +105,13 @@ impl Command {
             }
             Command::Reorder { id, after_index, .. } => {
                 document.move_to_index(*id, *after_index);
+            }
+            Command::SetCanvasSize { after, .. } => {
+                document.canvas_width = after.0;
+                document.canvas_height = after.1;
+            }
+            Command::SetBackground { after, .. } => {
+                document.background = after.clone();
             }
             Command::Batch(commands) => {
                 for command in commands {
@@ -101,6 +146,24 @@ impl Command {
                     object.kind = ObjectKind::Image(*before);
                 }
             }
+            Command::SetShapeProperties { id, before, .. } => {
+                if let Some(object) = document.get_mut(*id) {
+                    match &mut object.kind {
+                        ObjectKind::Rectangle(props) | ObjectKind::Ellipse(props) => *props = *before,
+                        _ => {}
+                    }
+                }
+            }
+            Command::SetLineProperties { id, before, .. } => {
+                if let Some(object) = document.get_mut(*id) {
+                    object.kind = ObjectKind::Line(*before);
+                }
+            }
+            Command::SetPathProperties { id, before, .. } => {
+                if let Some(object) = document.get_mut(*id) {
+                    object.kind = ObjectKind::Path(before.clone());
+                }
+            }
             Command::SetParent { changes } => {
                 for (id, before, _) in changes {
                     if let Some(object) = document.get_mut(*id) {
@@ -110,6 +173,13 @@ impl Command {
             }
             Command::Reorder { id, before_index, .. } => {
                 document.move_to_index(*id, *before_index);
+            }
+            Command::SetCanvasSize { before, .. } => {
+                document.canvas_width = before.0;
+                document.canvas_height = before.1;
+            }
+            Command::SetBackground { before, .. } => {
+                document.background = before.clone();
             }
             Command::Batch(commands) => {
                 for command in commands.iter().rev() {
@@ -128,8 +198,13 @@ impl Command {
             Command::SetGeometry { id, .. } => vec![*id],
             Command::SetTextProperties { id, .. } => vec![*id],
             Command::SetImageProperties { id, .. } => vec![*id],
+            Command::SetShapeProperties { id, .. } => vec![*id],
+            Command::SetLineProperties { id, .. } => vec![*id],
+            Command::SetPathProperties { id, .. } => vec![*id],
             Command::SetParent { changes } => changes.iter().map(|(id, ..)| *id).collect(),
             Command::Reorder { id, .. } => vec![*id],
+            Command::SetCanvasSize { .. } => Vec::new(),
+            Command::SetBackground { .. } => Vec::new(),
             Command::Batch(commands) => commands.iter().flat_map(Command::affected_ids).collect(),
         }
     }
@@ -158,6 +233,16 @@ impl History {
 
     pub fn can_redo(&self) -> bool {
         !self.redo_stack.is_empty()
+    }
+
+    /// Changes on every `record`, `undo`, and `redo` (each pushes/pops
+    /// `undo_stack` by exactly one) — a cheap, exact signal that the
+    /// document was just permanently changed, used to mark the document
+    /// dirty without diffing it. Two dispatches with the same count mean
+    /// nothing was committed between them (a live/uncommitted preview
+    /// update, or an editor-only action like changing selection or zoom).
+    pub fn undo_count(&self) -> usize {
+        self.undo_stack.len()
     }
 
     pub fn record(&mut self, command: Command) {
