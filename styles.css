@@ -309,6 +309,28 @@ input {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
 }
 
+.canvas-settings__heading-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.canvas-settings__reset {
+  padding: 2px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  color: var(--text-tertiary);
+  border-radius: var(--radius-xs);
+  transition: background-color 0.12s var(--ease), color 0.12s var(--ease);
+}
+
+.canvas-settings__reset:hover {
+  background-color: var(--bg-hover);
+  color: var(--accent);
+}
+
 .canvas-settings__dimensions {
   display: flex;
   align-items: flex-end;

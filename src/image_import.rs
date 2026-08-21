@@ -18,7 +18,7 @@ use web_sys::{DataTransfer, DragEvent, File, FileList, HtmlImageElement, HtmlInp
 use crate::editor_state::{EditorAction, EditorContext};
 use crate::model::ObjectId;
 
-/// The three raster formats Apollo imports. Anything else (SVG, PDF,
+/// The three raster formats Synthia imports. Anything else (SVG, PDF,
 /// random files dragged in by mistake) is silently ignored rather than
 /// erroring — a design tool's drop zone shouldn't need a toast for "that
 /// wasn't a picture."

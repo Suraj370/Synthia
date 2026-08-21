@@ -1,5 +1,5 @@
 //! Native filesystem/dialog layer. Everything here is deliberately dumb:
-//! these commands know nothing about Apollo's document shape — they take
+//! these commands know nothing about Synthia's document shape — they take
 //! an opaque JSON string from the frontend and write it, or read a file
 //! and hand the string back. The frontend (where `DesignDocument` is
 //! defined) owns serialization; this crate only owns "show a native
@@ -8,7 +8,12 @@
 
 use tauri_plugin_dialog::DialogExt;
 
-const FILE_FILTER_NAME: &str = "Apollo Design";
+// Display label for the native file dialog's format dropdown only — purely
+// cosmetic. `FILE_EXTENSIONS` and the `.apollo` suffix below are the actual
+// save format and must NOT change: this is a rebrand (Apollo -> Synthia),
+// not a file-format change, and documents saved by earlier Apollo builds
+// must keep opening correctly.
+const FILE_FILTER_NAME: &str = "Synthia Design";
 const FILE_EXTENSIONS: [&str; 2] = ["apollo", "design"];
 
 #[derive(serde::Serialize)]

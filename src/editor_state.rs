@@ -11,7 +11,8 @@ use yew::prelude::*;
 use crate::history::{batch, Command, History};
 use crate::model::{
     DesignDocument, DesignObject, Geometry, ImageFit, ImageProperties, LineProperties, ObjectId, ObjectKind, PathProperties,
-    ShapeProperties, TextProperties, TextSizeMode, DUPLICATE_OFFSET, MIN_CANVAS_SIZE,
+    ShapeProperties, TextProperties, TextSizeMode, DEFAULT_BACKGROUND, DEFAULT_CANVAS_HEIGHT, DEFAULT_CANVAS_WIDTH, DUPLICATE_OFFSET,
+    MIN_CANVAS_SIZE,
 };
 
 /// An imported image is scaled down (never up) so its larger dimension is
@@ -268,6 +269,13 @@ pub enum EditorAction {
     /// edit, the eyedropper, or the single step recorded when a
     /// color-picker drag gesture ends.
     CommitBackground { before: String, after: String },
+    /// The Canvas Size panel's "Reset to Default" — restores canvas width/
+    /// height/background to `DEFAULT_CANVAS_WIDTH`/`DEFAULT_CANVAS_HEIGHT`/
+    /// `DEFAULT_BACKGROUND` as one undo step. Never touches objects (same
+    /// "resize the canvas, not the content" default as a plain width/
+    /// height edit) — only the canvas/background fields it shares with
+    /// `SetCanvasSize`/`CommitBackground` are affected.
+    ResetCanvasDefaults,
 }
 
 /// Writes `properties` onto `id`'s `ObjectKind::Text`, and — for
@@ -844,6 +852,28 @@ impl Reducible for EditorState {
                 if before != after {
                     next.document.background = after.clone();
                     next.history.record(Command::SetBackground { before, after });
+                }
+            }
+
+            EditorAction::ResetCanvasDefaults => {
+                let mut commands = Vec::new();
+
+                let before_size = (next.document.canvas_width, next.document.canvas_height);
+                let after_size = (DEFAULT_CANVAS_WIDTH, DEFAULT_CANVAS_HEIGHT);
+                if before_size != after_size {
+                    next.document.canvas_width = after_size.0;
+                    next.document.canvas_height = after_size.1;
+                    commands.push(Command::SetCanvasSize { before: before_size, after: after_size });
+                }
+
+                let before_background = next.document.background.clone();
+                if before_background != DEFAULT_BACKGROUND {
+                    next.document.background = DEFAULT_BACKGROUND.to_string();
+                    commands.push(Command::SetBackground { before: before_background, after: DEFAULT_BACKGROUND.to_string() });
+                }
+
+                if let Some(command) = batch(commands) {
+                    next.history.record(command);
                 }
             }
         }

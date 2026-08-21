@@ -163,17 +163,42 @@ pub fn document_settings_panel(props: &DocumentSettingsPanelProps) -> Html {
         })
     };
 
+    let on_reset_defaults = {
+        let editor = editor.clone();
+        Callback::from(move |_: MouseEvent| editor.dispatch(EditorAction::ResetCanvasDefaults))
+    };
+
     let on_close = props.on_close.clone();
 
     // The scrim and the popover are siblings, not parent/child: a click
     // inside the popover bubbles to its own ancestors, never to the scrim,
     // so closing-on-outside-click falls out for free without needing to
     // stop propagation on every inner control.
+    //
+    // `prevent_default` on the scrim's mousedown matters beyond just
+    // dismissing the popover cleanly: the scrim itself isn't focusable, so
+    // without this a click on it blurs whatever *was* focused (e.g. the
+    // background hex field) straight to `<body>` — which sits outside
+    // `.app-shell`'s subtree, so `app.rs`'s keydown handler (Ctrl+Z/Y,
+    // Delete, arrow-nudge, ...) stops receiving events entirely until the
+    // user clicks back into the canvas. Blocking the browser's default
+    // focus-stealing behavior here keeps focus wherever it already was,
+    // so Undo/Redo keep working right after closing the panel.
+    let on_scrim_mousedown = Callback::from(move |event: MouseEvent| {
+        event.prevent_default();
+        on_close.emit(());
+    });
+
     html! {
         <>
-            <div class="canvas-settings-scrim" onmousedown={Callback::from(move |_| on_close.emit(()))}></div>
+            <div class="canvas-settings-scrim" onmousedown={on_scrim_mousedown}></div>
             <div class="canvas-settings">
-                <h3 class="right-panel__subheading">{"Canvas Size"}</h3>
+                <div class="canvas-settings__heading-row">
+                    <h3 class="right-panel__subheading">{"Canvas Size"}</h3>
+                    <button type="button" class="canvas-settings__reset" title="Restore default size and background" onclick={on_reset_defaults}>
+                        {"Reset to Default"}
+                    </button>
+                </div>
 
                 <div class="canvas-settings__dimensions">
                     <label class="right-panel__field">

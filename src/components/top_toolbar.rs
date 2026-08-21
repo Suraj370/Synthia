@@ -1,4 +1,5 @@
-use web_sys::HtmlInputElement;
+use wasm_bindgen::JsCast;
+use web_sys::{HtmlElement, HtmlInputElement};
 use yew::prelude::*;
 
 use crate::components::document_settings::DocumentSettingsPanel;
@@ -102,6 +103,31 @@ pub fn top_toolbar() -> Html {
     let show_canvas_settings = use_state(|| false);
     let error_message = use_state(|| None::<String>);
 
+    // The Canvas Size popover unmounts its own DOM (scrim + panel,
+    // including whatever field the user was just typing into) the instant
+    // it closes. When the focused element is removed from the document,
+    // the browser resets focus to `<body>` — which sits outside
+    // `.app-shell`'s subtree, so `app.rs`'s keydown handler (Ctrl+Z/Y,
+    // Delete, arrow-nudge, ...) silently stops receiving events. Once the
+    // panel has actually closed (post-render, so the DOM removal already
+    // happened), send focus back to the canvas so keyboard shortcuts work
+    // immediately without the user needing an extra click first.
+    {
+        let show_canvas_settings_value = *show_canvas_settings;
+        use_effect_with(show_canvas_settings_value, move |open| {
+            if !*open {
+                if let Some(canvas) = web_sys::window()
+                    .and_then(|window| window.document())
+                    .and_then(|document| document.query_selector(".canvas-area").ok().flatten())
+                    .and_then(|element| element.dyn_into::<HtmlElement>().ok())
+                {
+                    let _ = canvas.focus();
+                }
+            }
+            || ()
+        });
+    }
+
     let on_undo = {
         let editor = editor.clone();
         Callback::from(move |_| editor.dispatch(EditorAction::Undo))
@@ -111,7 +137,7 @@ pub fn top_toolbar() -> Html {
         Callback::from(move |_| editor.dispatch(EditorAction::Redo))
     };
 
-    // Image import now lives on its own button — Open is Apollo's own
+    // Image import now lives on its own button — Open is Synthia's own
     // document format, per the file-system fix this toolbar is part of.
     let on_import_click = {
         let import_input_ref = import_input_ref.clone();
@@ -258,7 +284,7 @@ pub fn top_toolbar() -> Html {
             <header class="toolbar">
                 <div class="toolbar__section toolbar__section--brand">
                     <span class="toolbar__logo">{"◆"}</span>
-                    <span class="toolbar__title">{"Apollo"}</span>
+                    <span class="toolbar__title">{"Synthia"}</span>
                 </div>
 
                 <div class="toolbar__divider"></div>

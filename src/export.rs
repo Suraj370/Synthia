@@ -170,7 +170,7 @@ pub fn document_to_svg(document: &DesignDocument) -> String {
 /// Waits for `image`'s `load` (or `error`) event via a hand-built
 /// `Promise` — the standard wasm-bindgen pattern for bridging a DOM
 /// callback into `async`/`await`, used here instead of a crate since it's
-/// a dozen lines and this is the only place Apollo needs it.
+/// a dozen lines and this is the only place Synthia needs it.
 async fn wait_for_load(image: &HtmlImageElement) -> Result<(), String> {
     let image_ok = image.clone();
     let image_err = image.clone();
@@ -304,6 +304,22 @@ mod tests {
         assert!(svg.contains("<rect"));
         assert!(svg.contains("translate(10 20)"));
         assert!(svg.contains("rgba(17, 34, 51, 1)"));
+    }
+
+    #[test]
+    fn exports_the_document_background_as_the_first_rect() {
+        let mut document = DesignDocument::default();
+        document.background = "#FF0000".to_string();
+        document.insert(ObjectKind::Rectangle(ShapeProperties::default()), Geometry::new(0.0, 0.0, 10.0, 10.0));
+
+        // PNG export rasterizes this same SVG, so the background rect
+        // carrying the document's color, and being emitted before any
+        // object (painting underneath everything), is what makes the
+        // background actually show up rather than sit on top of content.
+        let svg = document_to_svg(&document);
+        let background_index = svg.find("fill=\"#FF0000\"").expect("a background rect with the document's color");
+        let first_object_index = svg.find("<g ").expect("the rectangle object's <g> wrapper");
+        assert!(background_index < first_object_index);
     }
 
     #[test]

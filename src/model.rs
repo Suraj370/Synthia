@@ -355,7 +355,7 @@ pub struct TextProperties {
     /// Extra space between characters, in the same units as `font_size`.
     pub letter_spacing: f64,
     /// Color for the glyphs — the same typed `Color` every fill/stroke in
-    /// Apollo uses.
+    /// Synthia uses.
     pub fill: Color,
     pub text_decoration: TextDecoration,
     pub size_mode: TextSizeMode,
@@ -416,14 +416,12 @@ pub struct DesignObject {
     pub parent_id: Option<ObjectId>,
 }
 
-/// Default artboard size for a new document. Not yet user-editable (no UI
-/// exposes changing it), but a real field on the document — rather than a
-/// hardcoded render-time constant — since the saved file format needs to
-/// round-trip it, and a future resizable-canvas feature has a home to
-/// land in.
+/// Default artboard size/background for a new document — also what the
+/// Canvas Size panel's "Reset to Default" restores, so it's `pub` rather
+/// than a render-time-only constant.
 pub const DEFAULT_CANVAS_WIDTH: f64 = 800.0;
 pub const DEFAULT_CANVAS_HEIGHT: f64 = 600.0;
-const DEFAULT_BACKGROUND: &str = "#19191c";
+pub const DEFAULT_BACKGROUND: &str = "#19191c";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DesignDocument {
@@ -628,5 +626,44 @@ impl DesignDocument {
 
         let group_object = self.get(group_id)?.clone();
         Some((group_object, changes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Apollo -> Synthia rename touched only display strings (window
+    /// title, toolbar label, dialog copy) — never `DesignDocument` or its
+    /// `serde` shape. This proves the save format is untouched: a document
+    /// with a rectangle, text, an image reference, a group, custom canvas
+    /// dimensions, and a custom background survives a full JSON round-trip
+    /// (exactly what `document_io.rs` does for real on Save/Open) with
+    /// every field intact, so a file saved by an earlier Apollo build still
+    /// opens correctly in Synthia.
+    #[test]
+    fn document_survives_a_full_save_open_round_trip() {
+        let mut document = DesignDocument::default();
+        document.canvas_width = 1920.0;
+        document.canvas_height = 1080.0;
+        document.background = "#FF0000".to_string();
+
+        let rect_id = document.insert(ObjectKind::Rectangle(ShapeProperties::default()), Geometry::new(10.0, 20.0, 100.0, 50.0));
+        let text_id = document.insert(
+            ObjectKind::Text(TextProperties { content: "Hello Synthia".to_string(), ..TextProperties::default() }),
+            Geometry::new(0.0, 0.0, 200.0, 40.0),
+        );
+        let asset_id = document.assets.insert("photo.png".to_string(), "image/png".to_string(), 800.0, 600.0, "blob:example".to_string());
+        document.insert(ObjectKind::Image(ImageProperties { asset_id, fit: ImageFit::Crop }), Geometry::new(300.0, 300.0, 150.0, 150.0));
+        document.group(&[rect_id, text_id]).expect("grouping 2 objects should succeed");
+
+        let saved = serde_json::to_string_pretty(&document).expect("document should serialize");
+        let reopened: DesignDocument = serde_json::from_str(&saved).expect("document should deserialize");
+
+        assert_eq!(document, reopened);
+        assert_eq!(reopened.canvas_width, 1920.0);
+        assert_eq!(reopened.canvas_height, 1080.0);
+        assert_eq!(reopened.background, "#FF0000");
+        assert_eq!(reopened.objects.len(), 4); // rectangle, text, image, group
     }
 }

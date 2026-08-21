@@ -3,7 +3,7 @@
 //! alpha slider, hex/RGB/alpha fields, and (where the browser supports it)
 //! an eyedropper. Used identically by the shape Fill/Stroke controls and
 //! the text Fill control in `right_panel.rs` — the one color-editing
-//! surface in Apollo.
+//! surface in Synthia.
 //!
 //! Dragging in the SV area or a slider mirrors how canvas object drags
 //! work (`canvas_area.rs`): every pointer move calls `on_live` (applied to
@@ -53,7 +53,7 @@ fn eyedropper_available() -> bool {
 /// Opens the browser's native `EyeDropper` (Chromium/WebView2 only — the
 /// same engine Tauri uses on Windows) via raw JS interop rather than typed
 /// `web_sys` bindings, so this doesn't need a new `web-sys` feature flag.
-/// Samples anywhere on screen, not just the Apollo canvas — the API has no
+/// Samples anywhere on screen, not just the Synthia canvas — the API has no
 /// narrower mode — which in practice covers "sample a color from the
 /// canvas" and then some.
 async fn sample_eyedropper() -> Option<(u8, u8, u8)> {

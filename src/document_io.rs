@@ -63,13 +63,15 @@ pub async fn save(document: &DesignDocument, existing_path: Option<String>, sugg
 }
 
 /// Shows the native open dialog, reads the chosen file, and parses it as
-/// a `DesignDocument`. A malformed or non-Apollo file produces a readable
-/// `Err` instead of panicking.
+/// a `DesignDocument`. A malformed or non-Synthia file produces a readable
+/// `Err` instead of panicking. `DesignDocument`'s shape/format is
+/// unaffected by the Apollo -> Synthia rename, so files saved by earlier
+/// Apollo builds parse here exactly the same as ones saved by Synthia.
 pub async fn open() -> Result<OpenOutcome, String> {
     match invoke::<_, Option<OpenResponse>>("open_document", &NoArgs {}).await {
         Ok(Some(response)) => {
             let document: DesignDocument =
-                serde_json::from_str(&response.contents).map_err(|error| format!("This file isn't a valid Apollo document: {error}"))?;
+                serde_json::from_str(&response.contents).map_err(|error| format!("This file isn't a valid Synthia document: {error}"))?;
             Ok(OpenOutcome::Opened { document, path: response.path, filename: response.filename })
         }
         Ok(None) => Ok(OpenOutcome::Cancelled),

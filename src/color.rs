@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 /// An RGB color with a separate 0.0-1.0 alpha channel. The one color
-/// representation used throughout Apollo: hex input, RGB fields, the
+/// representation used throughout Synthia: hex input, RGB fields, the
 /// picker's gradients, and an eyedropper sample all normalize into this
 /// same shape, so nothing downstream has to guess where a color came from.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
