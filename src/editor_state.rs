@@ -777,12 +777,25 @@ impl Reducible for EditorState {
             }
 
             EditorAction::LoadDocument { document, path, filename } => {
+                // `expanded_groups` is never part of the saved file (it's
+                // pure Layers-panel UI state — see `EditorState`'s docs),
+                // so it isn't restored from anywhere; it's derived fresh
+                // from the loaded document's own group objects instead.
+                // Every group (nested ones included — `ObjectKind::Group`
+                // doesn't distinguish depth) starts expanded, exactly like
+                // `GroupSelected` already expands a group the moment it's
+                // created in the current session. Without this, a loaded
+                // group starts collapsed while a freshly created one
+                // doesn't, which is what actually made a reopened group
+                // look impossible to "enter" — its children were still
+                // fully selectable/editable the whole time, just hidden
+                // behind an unfamiliar collapsed Layers row.
+                next.expanded_groups = document.objects.iter().filter(|object| object.kind.is_group()).map(|object| object.id).collect();
                 next.document = document;
                 next.selected_ids = BTreeSet::new();
                 next.active_tool = Tool::Select;
                 next.history = History::default();
                 next.editing_text = None;
-                next.expanded_groups = BTreeSet::new();
                 next.file_path = Some(path);
                 next.document_title = filename;
                 next.zoom = DEFAULT_ZOOM;
@@ -903,4 +916,220 @@ pub type EditorContext = UseReducerHandle<EditorState>;
 #[hook]
 pub fn use_editor() -> EditorContext {
     use_context::<EditorContext>().expect("EditorContext to be provided by App")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ShapeProperties;
+
+    /// The id, among `ids`, whose object is a group — panics if none is,
+    /// since every assertion below needs to tell the group apart from its
+    /// duplicated/pasted children without assuming any particular id
+    /// ordering (grouping always creates the group *after* its children,
+    /// but `expand_with_descendants` re-sorts by id before duplicating/
+    /// copying, so the group is not reliably first or last).
+    fn group_among(state: &EditorState, ids: &BTreeSet<ObjectId>) -> ObjectId {
+        ids.iter().copied().find(|id| state.document.get(*id).is_some_and(|o| o.kind.is_group())).expect("selection should include a group")
+    }
+
+    /// Builds a document with two objects grouped together, round-trips it
+    /// through JSON exactly like Save/Open does (`document_io.rs` does
+    /// nothing more than this for non-image fields), then drives the *real*
+    /// reducer through select/move/undo/redo/ungroup/regroup/duplicate/
+    /// copy/paste/delete — the full set of group operations a user would
+    /// exercise on a freshly reopened file. None of it should behave any
+    /// differently than it would in a document that was never saved, since
+    /// `LoadDocument` hands the reopened `DesignDocument` to a fresh
+    /// `EditorState` the exact same way this test does.
+    #[test]
+    fn a_group_behaves_identically_after_a_save_open_round_trip() {
+        let mut document = DesignDocument::default();
+        let a = document.insert(ObjectKind::Rectangle(ShapeProperties::default()), Geometry::new(0.0, 0.0, 50.0, 50.0));
+        let b = document.insert(ObjectKind::Ellipse(ShapeProperties::default()), Geometry::new(100.0, 0.0, 50.0, 50.0));
+        let (group_object, _) = document.group(&[a, b]).expect("grouping 2 objects should succeed");
+        let group_id = group_object.id;
+
+        let saved = serde_json::to_string(&document).expect("document should serialize");
+        let reopened: DesignDocument = serde_json::from_str(&saved).expect("document should deserialize");
+        assert_eq!(document, reopened, "the document itself must round-trip exactly before any editor behavior is even tested");
+
+        // Mirrors exactly what `EditorAction::LoadDocument` produces: a
+        // fresh `EditorState` wrapping the reopened document.
+        let mut state = Rc::new(EditorState { document: reopened, ..EditorState::default() });
+
+        // Select the group.
+        state = state.reduce(EditorAction::SetSelection(BTreeSet::from([group_id])));
+        assert_eq!(state.selected_ids, BTreeSet::from([group_id]));
+
+        // Move the group — mirrors dragging it on canvas: every leaf
+        // descendant's geometry shifts by the same delta, one undo step.
+        let leaves: Vec<ObjectId> =
+            state.document.descendants_of(group_id).into_iter().filter(|id| !state.document.get(*id).unwrap().kind.is_group()).collect();
+        assert_eq!(leaves.len(), 2, "the group's two original children should still be its descendants after reopening");
+        let changes: Vec<(ObjectId, Geometry, Geometry)> = leaves
+            .iter()
+            .map(|&id| {
+                let before = state.document.get(id).unwrap().geometry;
+                (id, before, Geometry { x: before.x + 10.0, y: before.y + 5.0, ..before })
+            })
+            .collect();
+        state = state.reduce(EditorAction::CommitGeometries(changes));
+        assert_eq!(state.document.get(a).unwrap().geometry.x, 10.0);
+        assert_eq!(state.document.get(b).unwrap().geometry.x, 110.0);
+        assert!(state.history.can_undo());
+
+        // Undo the move, then redo it.
+        state = state.reduce(EditorAction::Undo);
+        assert_eq!(state.document.get(a).unwrap().geometry.x, 0.0);
+        assert_eq!(state.document.get(b).unwrap().geometry.x, 100.0);
+        state = state.reduce(EditorAction::Redo);
+        assert_eq!(state.document.get(a).unwrap().geometry.x, 10.0);
+
+        // Ungroup.
+        state = state.reduce(EditorAction::SetSelection(BTreeSet::from([group_id])));
+        state = state.reduce(EditorAction::UngroupSelected);
+        assert!(state.document.get(group_id).is_none(), "the group object itself should be gone");
+        assert_eq!(state.document.get(a).unwrap().parent_id, None);
+        assert_eq!(state.document.get(b).unwrap().parent_id, None);
+        assert_eq!(state.selected_ids, BTreeSet::from([a, b]));
+
+        // Undo the ungroup: the original group object comes back intact.
+        state = state.reduce(EditorAction::Undo);
+        assert!(state.document.get(group_id).is_some());
+        assert_eq!(state.document.get(a).unwrap().parent_id, Some(group_id));
+
+        // Redo the ungroup, then regroup from scratch (a new group id,
+        // since `a`/`b` are top-level again).
+        state = state.reduce(EditorAction::Redo);
+        state = state.reduce(EditorAction::SetSelection(BTreeSet::from([a, b])));
+        state = state.reduce(EditorAction::GroupSelected);
+        assert_eq!(state.selected_ids.len(), 1);
+        let new_group_id = *state.selected_ids.iter().next().unwrap();
+        assert!(state.document.get(new_group_id).unwrap().kind.is_group());
+        assert_eq!(state.document.get(a).unwrap().parent_id, Some(new_group_id));
+
+        // Duplicate the group — selection becomes the group *and* its
+        // freshly duplicated children (not just the group), same as
+        // duplicating any other object always selects everything created.
+        state = state.reduce(EditorAction::DuplicateObjects(vec![new_group_id]));
+        assert_eq!(state.selected_ids.len(), 3);
+        let duplicated_group_id = group_among(&state, &state.selected_ids);
+        assert_ne!(duplicated_group_id, new_group_id);
+        assert_eq!(state.document.children_of(Some(duplicated_group_id)).count(), 2);
+
+        // Copy the duplicated group (+ its children), then paste it.
+        state = state.reduce(EditorAction::Copy);
+        assert_eq!(state.clipboard.len(), 3, "copy should include the group and both of its children");
+        state = state.reduce(EditorAction::Paste);
+        assert_eq!(state.selected_ids.len(), 3);
+        let pasted_group_id = group_among(&state, &state.selected_ids);
+        assert_eq!(state.document.children_of(Some(pasted_group_id)).count(), 2);
+
+        // Delete the pasted group by id alone — deletion must cascade to
+        // its children the same way it does for a group made this session.
+        let before_count = state.document.objects.len();
+        state = state.reduce(EditorAction::DeleteObjects(vec![pasted_group_id]));
+        assert_eq!(state.document.objects.len(), before_count - 3);
+        assert!(state.document.get(pasted_group_id).is_none());
+
+        // Undo the delete: the group and both children come back exactly.
+        state = state.reduce(EditorAction::Undo);
+        assert!(state.document.get(pasted_group_id).is_some());
+        assert_eq!(state.document.children_of(Some(pasted_group_id)).count(), 2);
+    }
+
+    /// `DesignDocument::group` has no special case that forbids a group
+    /// from being one of the ids grouped — nesting is already structurally
+    /// supported by the same flat `parent_id`-per-object model regular
+    /// grouping uses (see `model.rs`'s module docs). This confirms a
+    /// nested group's parent/child chain — inner group, its 2 leaves, and
+    /// the outer group wrapping the inner group plus a third leaf —
+    /// survives a JSON round-trip with every relationship intact.
+    #[test]
+    fn nested_groups_survive_a_save_open_round_trip() {
+        let mut document = DesignDocument::default();
+        let a = document.insert(ObjectKind::Rectangle(ShapeProperties::default()), Geometry::new(0.0, 0.0, 20.0, 20.0));
+        let b = document.insert(ObjectKind::Ellipse(ShapeProperties::default()), Geometry::new(30.0, 0.0, 20.0, 20.0));
+        let (inner_group, _) = document.group(&[a, b]).expect("inner grouping should succeed");
+        let c = document.insert(ObjectKind::Rectangle(ShapeProperties::default()), Geometry::new(0.0, 30.0, 20.0, 20.0));
+        let (outer_group, _) = document.group(&[inner_group.id, c]).expect("outer grouping should succeed");
+
+        let saved = serde_json::to_string(&document).expect("document should serialize");
+        let reopened: DesignDocument = serde_json::from_str(&saved).expect("document should deserialize");
+        assert_eq!(document, reopened);
+
+        assert_eq!(reopened.get(inner_group.id).unwrap().parent_id, Some(outer_group.id));
+        assert_eq!(reopened.get(a).unwrap().parent_id, Some(inner_group.id));
+        assert_eq!(reopened.get(b).unwrap().parent_id, Some(inner_group.id));
+        assert_eq!(reopened.get(c).unwrap().parent_id, Some(outer_group.id));
+
+        // `descendants_of` the outer group must walk through the nested
+        // inner group to find every leaf, the same as it would pre-save.
+        let mut descendants = reopened.descendants_of(outer_group.id);
+        descendants.sort_unstable();
+        let mut expected = vec![inner_group.id, a, b, c];
+        expected.sort_unstable();
+        assert_eq!(descendants, expected);
+
+        // Selecting and moving the outer group should move all 3 leaves
+        // (a, b, c) — the inner group is not itself a "leaf" to move.
+        let state = Rc::new(EditorState { document: reopened, ..EditorState::default() });
+        let leaves: Vec<ObjectId> =
+            state.document.descendants_of(outer_group.id).into_iter().filter(|id| !state.document.get(*id).unwrap().kind.is_group()).collect();
+        let mut sorted_leaves = leaves.clone();
+        sorted_leaves.sort_unstable();
+        let mut expected_leaves = vec![a, b, c];
+        expected_leaves.sort_unstable();
+        assert_eq!(sorted_leaves, expected_leaves);
+    }
+
+    /// The actual difference between a group made this session and one
+    /// just reopened: `GroupSelected` auto-expands a freshly created group
+    /// in the Layers panel (`next.expanded_groups.insert(...)`), but
+    /// `LoadDocument` used to always start with `expanded_groups` empty —
+    /// so a loaded group rendered collapsed, hiding its children behind an
+    /// easy-to-miss caret toggle. Nothing about selection, movement, or
+    /// editing was ever actually broken (see the two tests above), but a
+    /// user couldn't tell that without knowing to click the caret first.
+    /// `expanded_groups` must never be *persisted* (it's UI state, not
+    /// part of `DesignDocument`), so this drives it through the real
+    /// `LoadDocument` action and checks it's derived fresh from the loaded
+    /// document's own groups — including a nested one — every group
+    /// starts expanded, exactly like a freshly created one would.
+    #[test]
+    fn loading_a_document_expands_every_group_including_nested_ones() {
+        let mut document = DesignDocument::default();
+        let a = document.insert(ObjectKind::Rectangle(ShapeProperties::default()), Geometry::new(0.0, 0.0, 20.0, 20.0));
+        let b = document.insert(ObjectKind::Ellipse(ShapeProperties::default()), Geometry::new(30.0, 0.0, 20.0, 20.0));
+        let (inner_group, _) = document.group(&[a, b]).expect("inner grouping should succeed");
+        let c = document.insert(ObjectKind::Rectangle(ShapeProperties::default()), Geometry::new(0.0, 30.0, 20.0, 20.0));
+        let (outer_group, _) = document.group(&[inner_group.id, c]).expect("outer grouping should succeed");
+
+        let saved = serde_json::to_string(&document).expect("document should serialize");
+        let reopened: DesignDocument = serde_json::from_str(&saved).expect("document should deserialize");
+
+        let state = Rc::new(EditorState::default());
+        let state = state.reduce(EditorAction::LoadDocument { document: reopened, path: "test.apollo".to_string(), filename: "test".to_string() });
+
+        assert_eq!(
+            state.expanded_groups,
+            BTreeSet::from([inner_group.id, outer_group.id]),
+            "every group in a freshly loaded document should start expanded, inner and outer alike"
+        );
+
+        // With both levels expanded, the Layers panel would render Rectangle
+        // A/B and the Text/Image equivalents as clickable rows the same way
+        // it does in a session where the groups were never saved — proven
+        // here by confirming a nested leaf is selectable and editable
+        // exactly like any other single object, via the same `SetSelection`
+        // + `CommitGeometries` path the Properties panel and canvas both use.
+        let state = state.reduce(EditorAction::SetSelection(BTreeSet::from([a])));
+        assert_eq!(state.selected_ids, BTreeSet::from([a]));
+        let before = state.document.get(a).unwrap().geometry;
+        let after = Geometry { x: before.x + 25.0, ..before };
+        let state = state.reduce(EditorAction::CommitGeometries(vec![(a, before, after)]));
+        assert_eq!(state.document.get(a).unwrap().geometry.x, 25.0);
+        assert_eq!(state.document.get(b).unwrap().geometry.x, 30.0, "moving one nested child must not move its sibling");
+    }
 }

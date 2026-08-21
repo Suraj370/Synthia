@@ -14,9 +14,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{Blob, BlobPropertyBag, HtmlCanvasElement, HtmlImageElement, Response, Url};
+use web_sys::{Blob, BlobPropertyBag, HtmlCanvasElement, HtmlImageElement, Url};
 
-use crate::asset_manager::AssetId;
+use crate::asset_manager::{self, AssetId};
 use crate::model::{
     DesignDocument, DesignObject, Geometry, ImageFit, ImageProperties, LineProperties, ObjectKind, PathProperties, ShapeProperties,
     TextAlign, TextProperties, TextSizeMode,
@@ -159,48 +159,17 @@ fn object_svg(object: &DesignObject, resolved_images: &HashMap<AssetId, String>)
     format!(r#"<g transform="{}" opacity="{}">{}</g>"#, transform_attr(g), g.opacity, inner)
 }
 
-/// Fetches `reference`'s bytes and re-encodes them as a `data:` URL —
-/// already a no-op passthrough if it's a `data:` URL to begin with (a
-/// document reopened from disk, or a future non-blob asset source, either
-/// way nothing to fetch). `blob:`/`http(s):` references go through
-/// `fetch`, which resolves blob: URLs from the browser's own in-memory
-/// registry — no network involved, just the standard API for reading a
-/// Blob's bytes back out. Falls back to the original (unresolved)
-/// reference on any failure, matching every other "missing/broken asset"
-/// fallback in this file: the rest of the export still completes.
-async fn resolve_to_data_url(reference: &str, mime_type: &str) -> String {
-    let fallback = || reference.to_string();
-    if reference.starts_with("data:") {
-        return fallback();
-    }
-    let Some(window) = web_sys::window() else { return fallback() };
-
-    let Ok(response_value) = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(reference)).await else {
-        return fallback();
-    };
-    let Ok(response) = response_value.dyn_into::<Response>() else { return fallback() };
-    let Ok(buffer_promise) = response.array_buffer() else { return fallback() };
-    let Ok(buffer_value) = wasm_bindgen_futures::JsFuture::from(buffer_promise).await else { return fallback() };
-
-    // `btoa` expects a "binary string" — one JS UTF-16 code unit per byte
-    // (0-255) — not UTF-8 text, so this isn't a text encoding at all, just
-    // the standard byte->char-code round trip `document_to_png` already
-    // does in reverse (`atob` + `chars().map(|c| c as u8)`) to decode its
-    // own rasterized PNG.
-    let bytes = js_sys::Uint8Array::new(&buffer_value).to_vec();
-    let binary_string: String = bytes.iter().map(|&b| b as char).collect();
-    match window.btoa(&binary_string) {
-        Ok(base64) => format!("data:{mime_type};base64,{base64}"),
-        Err(_) => fallback(),
-    }
-}
-
 /// Resolves every image asset actually referenced by `document`'s objects
 /// into a self-contained `data:` URL, keyed by asset id (deduplicated, so
 /// several objects sharing one asset only fetch it once). Awaited entirely
 /// up front — before any markup is built — so by the time `document_markup`
 /// runs, every `<image href>` it writes is already a real, self-contained
 /// value; nothing in the SVG-building step itself needs to wait on I/O.
+/// Uses `asset_manager::resolve_to_data_url` — the same conversion
+/// `document_io.rs` uses to make Save self-contained — so a freshly
+/// imported (still `blob:`) asset and one just restored from a reopened
+/// document (already a `data:` URL, resolved instantly) both work here
+/// unchanged.
 async fn resolve_asset_data_urls(document: &DesignDocument) -> HashMap<AssetId, String> {
     let mut resolved = HashMap::new();
     for object in &document.objects {
@@ -209,7 +178,7 @@ async fn resolve_asset_data_urls(document: &DesignDocument) -> HashMap<AssetId, 
             continue;
         }
         if let Some(asset) = document.assets.get(props.asset_id) {
-            let data_url = resolve_to_data_url(&asset.reference, &asset.mime_type).await;
+            let data_url = asset_manager::resolve_to_data_url(&asset.reference, &asset.mime_type).await;
             resolved.insert(props.asset_id, data_url);
         }
     }
