@@ -3,6 +3,7 @@
 A lightweight, local graphic design editor built with **Tauri, Rust, Yew, and SVG**.
 
 Synthia is designed for creating posters, social media graphics, promotional designs, thumbnails, and other everyday visual content without requiring a cloud service or AI.
+<img width="1603" height="992" alt="Screenshot 2026-08-21 181556" src="https://github.com/user-attachments/assets/ce215c16-aed1-4fa9-b32c-30178b766397" />
 
 
 ## Features
