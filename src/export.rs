@@ -9,11 +9,14 @@
 //! truth; it's a one-way projection built fresh from `DesignDocument` on
 //! every export, exactly like the canvas renderer is.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{Blob, BlobPropertyBag, HtmlCanvasElement, HtmlImageElement, Url};
+use web_sys::{Blob, BlobPropertyBag, HtmlCanvasElement, HtmlImageElement, Response, Url};
 
+use crate::asset_manager::AssetId;
 use crate::model::{
     DesignDocument, DesignObject, Geometry, ImageFit, ImageProperties, LineProperties, ObjectKind, PathProperties, ShapeProperties,
     TextAlign, TextProperties, TextSizeMode,
@@ -109,13 +112,20 @@ fn text_svg(props: &TextProperties, g: &Geometry) -> String {
     format!(r#"<text x="{x}" y="0" text-anchor="{anchor}" font-size="{}" style="{style}">{tspans}</text>"#, props.font_size)
 }
 
-/// An image's own reference is a browser object URL (see
-/// `asset_manager.rs`'s module docs) — valid for PNG export, which
-/// rasterizes within the same session, but a saved `.svg` file's `<image
-/// href>` won't resolve once the session ends. Same disclosed tradeoff
-/// `document_io.rs` already accepts for save/open; not re-solved here.
-fn image_svg(props: &ImageProperties, g: &Geometry, document: &DesignDocument) -> String {
-    let Some(asset) = document.assets.get(props.asset_id) else {
+/// An image's own `reference` is a browser blob: URL (see
+/// `asset_manager.rs`'s module docs) — perfect for the live canvas (a real
+/// top-level document, in the same session that created it), but useless
+/// in an export: a saved `.svg` file's blob: URL is dead the moment the
+/// session ends, and — separately — a browser refuses to resolve *any*
+/// external resource (blob: included) referenced from inside an SVG that's
+/// itself only loaded as an `<img>` (exactly what `document_to_png` does to
+/// rasterize), which is why PNG export silently dropped images too. Both
+/// are solved the same way: `resolve_asset_data_urls` fetches each asset's
+/// bytes once, up front, and hands `image_svg` an already-resolved `data:`
+/// URL — self-contained, so it survives being written to disk *and* being
+/// loaded inside a restricted SVG-as-image context.
+fn image_svg(props: &ImageProperties, g: &Geometry, resolved_images: &HashMap<AssetId, String>) -> String {
+    let Some(href) = resolved_images.get(&props.asset_id) else {
         return String::new();
     };
     let preserve_aspect_ratio = match props.fit {
@@ -125,14 +135,14 @@ fn image_svg(props: &ImageProperties, g: &Geometry, document: &DesignDocument) -
     };
     format!(
         r#"<image href="{}" x="0" y="0" width="{}" height="{}" preserveAspectRatio="{}" />"#,
-        escape_xml(&asset.reference),
+        escape_xml(href),
         g.width,
         g.height,
         preserve_aspect_ratio
     )
 }
 
-fn object_svg(object: &DesignObject, document: &DesignDocument) -> String {
+fn object_svg(object: &DesignObject, resolved_images: &HashMap<AssetId, String>) -> String {
     if object.kind.is_group() {
         return String::new();
     }
@@ -143,17 +153,75 @@ fn object_svg(object: &DesignObject, document: &DesignDocument) -> String {
         ObjectKind::Line(props) => line_svg(props, g),
         ObjectKind::Path(props) => path_svg(props, g),
         ObjectKind::Text(props) => text_svg(props, g),
-        ObjectKind::Image(props) => image_svg(props, g, document),
+        ObjectKind::Image(props) => image_svg(props, g, resolved_images),
         ObjectKind::Group => String::new(),
     };
     format!(r#"<g transform="{}" opacity="{}">{}</g>"#, transform_attr(g), g.opacity, inner)
 }
 
-/// Serializes the whole document into a standalone SVG document string —
-/// same z-order (document list order), same per-object transform/opacity,
-/// as the live canvas. The document itself stays the only source of
-/// truth; this is rebuilt fresh on every export, never cached.
-pub fn document_to_svg(document: &DesignDocument) -> String {
+/// Fetches `reference`'s bytes and re-encodes them as a `data:` URL —
+/// already a no-op passthrough if it's a `data:` URL to begin with (a
+/// document reopened from disk, or a future non-blob asset source, either
+/// way nothing to fetch). `blob:`/`http(s):` references go through
+/// `fetch`, which resolves blob: URLs from the browser's own in-memory
+/// registry — no network involved, just the standard API for reading a
+/// Blob's bytes back out. Falls back to the original (unresolved)
+/// reference on any failure, matching every other "missing/broken asset"
+/// fallback in this file: the rest of the export still completes.
+async fn resolve_to_data_url(reference: &str, mime_type: &str) -> String {
+    let fallback = || reference.to_string();
+    if reference.starts_with("data:") {
+        return fallback();
+    }
+    let Some(window) = web_sys::window() else { return fallback() };
+
+    let Ok(response_value) = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(reference)).await else {
+        return fallback();
+    };
+    let Ok(response) = response_value.dyn_into::<Response>() else { return fallback() };
+    let Ok(buffer_promise) = response.array_buffer() else { return fallback() };
+    let Ok(buffer_value) = wasm_bindgen_futures::JsFuture::from(buffer_promise).await else { return fallback() };
+
+    // `btoa` expects a "binary string" — one JS UTF-16 code unit per byte
+    // (0-255) — not UTF-8 text, so this isn't a text encoding at all, just
+    // the standard byte->char-code round trip `document_to_png` already
+    // does in reverse (`atob` + `chars().map(|c| c as u8)`) to decode its
+    // own rasterized PNG.
+    let bytes = js_sys::Uint8Array::new(&buffer_value).to_vec();
+    let binary_string: String = bytes.iter().map(|&b| b as char).collect();
+    match window.btoa(&binary_string) {
+        Ok(base64) => format!("data:{mime_type};base64,{base64}"),
+        Err(_) => fallback(),
+    }
+}
+
+/// Resolves every image asset actually referenced by `document`'s objects
+/// into a self-contained `data:` URL, keyed by asset id (deduplicated, so
+/// several objects sharing one asset only fetch it once). Awaited entirely
+/// up front — before any markup is built — so by the time `document_markup`
+/// runs, every `<image href>` it writes is already a real, self-contained
+/// value; nothing in the SVG-building step itself needs to wait on I/O.
+async fn resolve_asset_data_urls(document: &DesignDocument) -> HashMap<AssetId, String> {
+    let mut resolved = HashMap::new();
+    for object in &document.objects {
+        let ObjectKind::Image(props) = &object.kind else { continue };
+        if resolved.contains_key(&props.asset_id) {
+            continue;
+        }
+        if let Some(asset) = document.assets.get(props.asset_id) {
+            let data_url = resolve_to_data_url(&asset.reference, &asset.mime_type).await;
+            resolved.insert(props.asset_id, data_url);
+        }
+    }
+    resolved
+}
+
+/// Builds the actual SVG markup for `document`, given every image asset it
+/// references already resolved to a self-contained `data:` URL — the pure,
+/// synchronous core that both `document_to_svg` and `document_to_png` share.
+/// Split out from asset resolution so it stays trivially testable with a
+/// plain `HashMap` instead of needing an async test harness.
+fn document_markup(document: &DesignDocument, resolved_images: &HashMap<AssetId, String>) -> String {
     let mut svg = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}"><rect x="0" y="0" width="{0}" height="{1}" fill="{2}" />"#,
         document.canvas_width,
@@ -161,10 +229,21 @@ pub fn document_to_svg(document: &DesignDocument) -> String {
         escape_xml(&document.background)
     );
     for object in &document.objects {
-        svg.push_str(&object_svg(object, document));
+        svg.push_str(&object_svg(object, resolved_images));
     }
     svg.push_str("</svg>");
     svg
+}
+
+/// Serializes the whole document into a standalone, self-contained SVG
+/// document string — same z-order (document list order), same per-object
+/// transform/opacity, as the live canvas, but with every image embedded as
+/// a `data:` URL rather than referencing the browser's temporary blob: URL
+/// (see `image_svg`'s docs). The document itself stays the only source of
+/// truth; this is rebuilt fresh on every export, never cached.
+pub async fn document_to_svg(document: &DesignDocument) -> String {
+    let resolved_images = resolve_asset_data_urls(document).await;
+    document_markup(document, &resolved_images)
 }
 
 /// Waits for `image`'s `load` (or `error`) event via a hand-built
@@ -190,15 +269,22 @@ async fn wait_for_load(image: &HtmlImageElement) -> Result<(), String> {
     wasm_bindgen_futures::JsFuture::from(promise).await.map(|_| ()).map_err(|_| "Could not rasterize the design for PNG export.".to_string())
 }
 
-/// Rasterizes `document` to PNG bytes: serialize to SVG, load it as an
-/// `<img>` (via a `Blob` URL, never a data URL — sidesteps having to
-/// percent/base64-encode arbitrary SVG text), draw it into an offscreen
-/// canvas sized to the artboard, and read the canvas back out as PNG.
-/// Every object stays a real vector shape right up until this one
-/// rasterization step, same as the "never rasterize until export" rule
-/// for the `<image>` element the canvas renderer already follows.
+/// Rasterizes `document` to PNG bytes: serialize to SVG (with every image
+/// already embedded as a `data:` URL — see `document_to_svg`), load *that*
+/// as an `<img>` (via a `Blob` URL — only the outer SVG document itself,
+/// never a per-image data URL, which is what keeps this from having to
+/// percent/base64-encode the whole SVG text), draw it into an offscreen
+/// canvas sized to the artboard, and read the canvas back out as PNG. Every
+/// object stays a real vector shape right up until this one rasterization
+/// step, same as the "never rasterize until export" rule for the `<image>`
+/// element the canvas renderer already follows. Embedding images as `data:`
+/// URLs isn't just about `.svg` file portability here: a browser also
+/// refuses to resolve *any* external resource (a `blob:` URL included)
+/// referenced from inside an SVG that's only loaded as an `<img>`, which is
+/// exactly what this function does to rasterize — a self-contained image
+/// reference is the only kind that survives being loaded this way.
 pub async fn document_to_png(document: &DesignDocument) -> Result<Vec<u8>, String> {
-    let svg_text = document_to_svg(document);
+    let svg_text = document_to_svg(document).await;
 
     let parts = js_sys::Array::new();
     parts.push(&JsValue::from_str(&svg_text));
@@ -269,10 +355,11 @@ async fn export_bytes(contents: Vec<u8>, suggested_name: String, extension: &str
     }
 }
 
-/// Exports the document as a standalone `.svg` file via the native save
-/// dialog.
+/// Exports the document as a standalone, self-contained `.svg` file (every
+/// image embedded as a `data:` URL — see `document_to_svg`) via the native
+/// save dialog.
 pub async fn export_svg(document: &DesignDocument, suggested_name: String) -> Result<ExportOutcome, String> {
-    export_bytes(document_to_svg(document).into_bytes(), suggested_name, "svg", "SVG Image").await
+    export_bytes(document_to_svg(document).await.into_bytes(), suggested_name, "svg", "SVG Image").await
 }
 
 /// Exports the document as a rasterized `.png` file via the native save
@@ -285,7 +372,7 @@ pub async fn export_png(document: &DesignDocument, suggested_name: String) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Color, DesignDocument, Geometry, ObjectKind, ShapeProperties};
+    use crate::model::{Color, DesignDocument, Geometry, ImageFit, ImageProperties, ObjectKind, ShapeProperties};
 
     #[test]
     fn escapes_special_characters() {
@@ -299,7 +386,7 @@ mod tests {
         props.fill = Color::rgb(0x11, 0x22, 0x33);
         document.insert(ObjectKind::Rectangle(props), Geometry::new(10.0, 20.0, 100.0, 50.0));
 
-        let svg = document_to_svg(&document);
+        let svg = document_markup(&document, &HashMap::new());
         assert!(svg.starts_with("<svg"));
         assert!(svg.contains("<rect"));
         assert!(svg.contains("translate(10 20)"));
@@ -316,10 +403,40 @@ mod tests {
         // carrying the document's color, and being emitted before any
         // object (painting underneath everything), is what makes the
         // background actually show up rather than sit on top of content.
-        let svg = document_to_svg(&document);
+        let svg = document_markup(&document, &HashMap::new());
         let background_index = svg.find("fill=\"#FF0000\"").expect("a background rect with the document's color");
         let first_object_index = svg.find("<g ").expect("the rectangle object's <g> wrapper");
         assert!(background_index < first_object_index);
+    }
+
+    #[test]
+    fn embeds_a_resolved_image_href_and_never_the_raw_blob_reference() {
+        let mut document = DesignDocument::default();
+        let asset_id = document.assets.insert("photo.png".to_string(), "image/png".to_string(), 400.0, 300.0, "blob:unresolved".to_string());
+        document.insert(ObjectKind::Image(ImageProperties { asset_id, fit: ImageFit::Crop }), Geometry::new(5.0, 5.0, 80.0, 60.0));
+
+        // `document_markup` is the pure core `document_to_svg` awaits after
+        // resolving assets — exercised directly here with a hand-built map
+        // so this test doesn't need a real fetch or an async test harness.
+        let mut resolved = HashMap::new();
+        resolved.insert(asset_id, "data:image/png;base64,AAAA".to_string());
+
+        let svg = document_markup(&document, &resolved);
+        assert!(svg.contains(r#"href="data:image/png;base64,AAAA""#));
+        assert!(svg.contains(r#"preserveAspectRatio="xMidYMid slice""#));
+        // The raw blob: reference must never leak into exported markup —
+        // it's meaningless outside the session that created it.
+        assert!(!svg.contains("blob:unresolved"));
+    }
+
+    #[test]
+    fn image_without_a_resolved_href_renders_nothing_instead_of_a_broken_reference() {
+        let mut document = DesignDocument::default();
+        let asset_id = document.assets.insert("photo.png".to_string(), "image/png".to_string(), 400.0, 300.0, "blob:whatever".to_string());
+        document.insert(ObjectKind::Image(ImageProperties { asset_id, fit: ImageFit::Fill }), Geometry::new(0.0, 0.0, 10.0, 10.0));
+
+        let svg = document_markup(&document, &HashMap::new());
+        assert!(!svg.contains("<image"));
     }
 
     #[test]
@@ -329,7 +446,7 @@ mod tests {
         let b = document.insert(ObjectKind::Ellipse(ShapeProperties::default()), Geometry::new(20.0, 0.0, 10.0, 10.0));
         document.group(&[a, b]).expect("grouping 2 objects should succeed");
 
-        let svg = document_to_svg(&document);
+        let svg = document_markup(&document, &HashMap::new());
         // Both children still render; the group object itself (no shape of
         // its own) contributes no markup. `<rect` count is 2: the artboard
         // background rect plus the one rectangle object.

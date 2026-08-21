@@ -16,7 +16,7 @@ web-sys = { version = "0.3", features = [
     "Element", "DomRect", "MouseEvent", "KeyboardEvent", "HtmlInputElement", "DragEvent",
     "HtmlTextAreaElement", "InputEvent", "FocusEvent", "HtmlSelectElement",
     "File", "FileList", "DataTransfer", "Blob", "BlobPropertyBag", "Url", "HtmlImageElement", "Event",
-    "WheelEvent", "Window", "Document", "HtmlCanvasElement", "CanvasRenderingContext2d",
+    "WheelEvent", "Window", "Document", "HtmlCanvasElement", "CanvasRenderingContext2d", "Response",
 ] }
 
 [workspace]
